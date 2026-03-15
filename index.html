@@ -4293,9 +4293,11 @@ function _setupAbly(resolve){
       closeOnUnload: true,
       echoMessages: false,
       tls: true,
-      transports: ['web_socket'],          // forcer WebSocket, éviter les erreurs XHR
-      disconnectedRetryTimeout: 4000,      // réessai auto après déconnexion
-      suspendedRetryTimeout: 12000         // réessai auto après suspension
+      transports: ['web_socket'],
+      fallbackHosts: [],
+      disconnectedRetryTimeout: 4000,
+      suspendedRetryTimeout: 12000,
+      logLevel: 0
     });
     let resolved=false;
     const finish=()=>{ if(!resolved){ resolved=true; resolve(); } };
