@@ -3889,12 +3889,12 @@ function loadQuizConfig(){
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  ONLINE — SYSTÈME EN LIGNE v30 (Ably temps réel)
-//  Canaux : frise:kv / frise:presence / frise:duels
-//  • Présence Ably native → compteur instantané (<100ms)
-//  • Invitations duel via push Ably (zéro polling)
-//  • Login avec mot de passe optionnel + sync multi-appareils
-//  • Déconnexion → disparaît du scoreboard uniquement via bouton Déco.
+//  ONLINE — SYSTÈME EN LIGNE v31 (Ably reconstruit)
+//  Namespace Ably dédié à ce site pour éviter tout conflit avec d'autres projets.
+//  • Scoreboard persistant (hors ligne visible tant que pas de déconnexion)
+//  • Présence temps réel séparée du stockage des comptes
+//  • Duels proposés uniquement aux joueurs réellement connectés
+//  • KV logique unifié avec clés physiques namespacées
 // ══════════════════════════════════════════════════════════════════
 let _currentUser = null;
 let _sbExpanded = null;
@@ -3908,6 +3908,9 @@ let _presenceMembers = {}; // name -> {name, color, ts}
 let _usersCache = [], _usersCacheTs = 0;
 let _sbPushInProgress = false, _sbUserIndexed = false;
 let _presenceDesired = false, _presenceJoined = false;
+let _ablyInitPromise = null;
+let _ablySubscriptionsReady = false;
+let _kvBootstrapPromise = null;
 
 const ONLINE_TTL = 15000;
 const POLL_INTERVAL_ACTIVE = 6000;
@@ -3919,11 +3922,89 @@ const USERS_CACHE_TTL_BG = 45000;
 const USER_COLORS = ['#2a7a8f','#2d7a5f','#c0392b','#6b4fa8','#b8922a','#1a6a9a','#7a4a9f','#1a8a62','#9a6a28'];
 const ABLY_KEY = 'omrAsg.61E1oQ:sJXWtnTzOlCdLP2t44fhmBB1RyMPURSJQJLNOPwccR8';
 
+const ONLINE_SCOPE = Object.freeze({
+  app: 'esh-scoreboard-v1',
+  clientPrefix: 'eshsb',
+  localPrefix: '__esh_scoreboard_v1__',
+  channels: {
+    kv: 'esh-scoreboard-v1:state',
+    chat: 'esh-scoreboard-v1:chat',
+    presence: 'esh-scoreboard-v1:presence',
+    duels: 'esh-scoreboard-v1:duels'
+  },
+  aliases: {
+    'frise:kv': 'esh-scoreboard-v1:state',
+    'ecg:kv': 'esh-scoreboard-v1:state',
+    'frise:chat': 'esh-scoreboard-v1:chat',
+    'ecg:chat': 'esh-scoreboard-v1:chat',
+    'frise:presence': 'esh-scoreboard-v1:presence',
+    'ecg:presence': 'esh-scoreboard-v1:presence',
+    'frise:duels': 'esh-scoreboard-v1:duels',
+    'ecg:duels': 'esh-scoreboard-v1:duels'
+  },
+  userIndexKey: 'players:index',
+  kvPrefix: 'esh-scoreboard-v1:kv:'
+});
+
 // Tab focus
 let _tabFocused = !document.hidden && document.hasFocus();
 document.addEventListener('visibilitychange', ()=>{ _tabFocused = !document.hidden && document.hasFocus(); });
 window.addEventListener('focus', ()=>{ _tabFocused = !document.hidden; });
 window.addEventListener('blur', ()=>{ _tabFocused = false; });
+
+function _safeSlug(value){
+  return (value||'').toString().trim().toLowerCase().replace(/[^a-z0-9]/g,'_');
+}
+function _normalizeLogicalKey(key){
+  if(!key) return '';
+  if(key === ONLINE_SCOPE.userIndexKey || key.startsWith('players:')) return key;
+  if(key === 'frise_users:index') return ONLINE_SCOPE.userIndexKey;
+  if(key.startsWith('frise_users:')) return 'players:' + key.slice('frise_users:'.length);
+  if(key.startsWith('frise_duel_result:')) return 'duel_result:' + key.slice('frise_duel_result:'.length);
+  if(key.startsWith('frise_duel:')) return 'duel:' + key.slice('frise_duel:'.length);
+  if(key === 'frise_dq_results') return 'daily_quiz_results';
+  if(key === 'frise_chat:messages') return 'chat_messages';
+  if(key.startsWith('frise_reactions:')) return 'reactions:' + key.slice('frise_reactions:'.length);
+  if(key.startsWith('frise_')) return key.slice('frise_'.length);
+  return key;
+}
+function _physicalKvKey(logicalKey){
+  return ONLINE_SCOPE.kvPrefix + _normalizeLogicalKey(logicalKey);
+}
+function _logicalKvKey(physicalKey){
+  if(typeof physicalKey !== 'string') return null;
+  return physicalKey.startsWith(ONLINE_SCOPE.kvPrefix)
+    ? physicalKey.slice(ONLINE_SCOPE.kvPrefix.length)
+    : null;
+}
+function _matchesStorageEventKey(eventKey, logicalKey){
+  const logical = _normalizeLogicalKey(logicalKey);
+  return eventKey === logicalKey || eventKey === _physicalKvKey(logical) || _logicalKvKey(eventKey) === logical;
+}
+function _localKvKey(logicalKey){
+  return ONLINE_SCOPE.localPrefix + _normalizeLogicalKey(logicalKey);
+}
+function _isCriticalKvKey(logicalKey){
+  const k = _normalizeLogicalKey(logicalKey);
+  return k === ONLINE_SCOPE.userIndexKey || k.startsWith('players:');
+}
+function _persistCriticalKv(logicalKey, value){
+  if(!_isCriticalKvKey(logicalKey)) return;
+  try{ localStorage.setItem(_localKvKey(logicalKey), value); }catch(e){}
+}
+function _restoreCriticalKv(logicalKey){
+  try{
+    const current = localStorage.getItem(_localKvKey(logicalKey));
+    if(current!==null) return current;
+  }catch(e){}
+  return null;
+}
+function _extractLogicalKeyFromLocalStorageKey(rawKey){
+  if(!rawKey) return null;
+  if(rawKey.startsWith(ONLINE_SCOPE.localPrefix)) return rawKey.slice(ONLINE_SCOPE.localPrefix.length);
+  if(rawKey.startsWith('_frise_kv_')) return _normalizeLogicalKey(rawKey.slice('_frise_kv_'.length));
+  return null;
+}
 
 function _shouldBePresent(){
   return !!(_ablyReady && _currentUser && !document.hidden && _tabFocused);
@@ -3937,10 +4018,8 @@ async function _syncPresence(force=false){
   else await _presenceLeave();
 }
 
-function sbUserKey(name){ return 'frise_users:'+name.toLowerCase().replace(/[^a-z0-9]/g,'_'); }
-function isOnline(u){ return u && isUserOnline(u.name); } // basé sur Ably Presence
-// SOURCE UNIQUE de présence — même fonction partout
-// SOURCE UNIQUE présence — _presenceMembers est indexé par NOM
+function sbUserKey(name){ return 'players:' + _safeSlug(name); }
+function isOnline(u){ return u && isUserOnline(u.name); }
 function isUserOnline(name){ return !!_presenceMembers[name]; }
 function _getPresenceNames(){ return new Set(Object.keys(_presenceMembers)); }
 function isOnlinePres(u){ return u && isUserOnline(u.name); }
@@ -3960,113 +4039,188 @@ async function _hashPassword(pw){
   return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('').slice(0,32);
 }
 
-// ── Ably ────────────────────────────────────────────────────────
+function _resolveChannelName(name){
+  if(!name) return ONLINE_SCOPE.channels.kv;
+  return ONLINE_SCOPE.aliases[name] || ONLINE_SCOPE.channels[name] || `${ONLINE_SCOPE.app}:${String(name).replace(/[^a-zA-Z0-9:_-]/g,'-')}`;
+}
+
 function _ablyChannel(name){
   if(!_ably) return null;
-  if(!_ablyChannels[name]) _ablyChannels[name] = _ably.channels.get(name);
-  return _ablyChannels[name];
+  const resolved = _resolveChannelName(name);
+  if(!_ablyChannels[resolved]) _ablyChannels[resolved] = _ably.channels.get(resolved);
+  return _ablyChannels[resolved];
+}
+
+async function _bootstrapKvFromHistory(force=false){
+  if(!_ablyReady) return _kv;
+  if(_kvBootstrapPromise && !force) return _kvBootstrapPromise;
+  _kvBootstrapPromise = (async()=>{
+    try{
+      let page = await _ablyChannel('kv').history({limit:1000,direction:'backwards'});
+      const seenPhysical = new Set();
+      do{
+        for(const msg of (page?.items||[])){
+          if(msg.name !== 'set' || !msg.data?.key || seenPhysical.has(msg.data.key)) continue;
+          seenPhysical.add(msg.data.key);
+          const logical = _logicalKvKey(msg.data.key);
+          if(!logical) continue;
+          _kv[logical] = msg.data.value;
+          _persistCriticalKv(logical, msg.data.value);
+        }
+        if(page?.hasNext()) page = await page.next(); else break;
+      }while(page);
+    }catch(e){ console.warn('[Online] bootstrap history error:', e); }
+    return _kv;
+  })();
+  const result = await _kvBootstrapPromise;
+  _kvBootstrapPromise = null;
+  return result;
+}
+
+async function _refreshPresenceSnapshot(){
+  if(!_ablyReady) return;
+  try{
+    const members = await _ablyChannel('presence').presence.get();
+    const next = {};
+    (members||[]).forEach(member=>{
+      if(member?.data?.name) next[member.data.name] = member.data;
+    });
+    _presenceMembers = next;
+    updateOnlineCount();
+  }catch(e){}
+}
+
+async function _subscribeRealtimeChannels(){
+  if(_ablySubscriptionsReady || !_ably) return;
+  _ablySubscriptionsReady = true;
+
+  const kvCh = _ablyChannel('kv');
+  kvCh.subscribe('set', msg=>{
+    const logical = _logicalKvKey(msg.data?.key);
+    if(!logical) return;
+    _kv[logical] = msg.data.value;
+    _persistCriticalKv(logical, msg.data.value);
+    if(logical.startsWith('players:') && logical !== ONLINE_SCOPE.userIndexKey) _onAblyUserUpdate(msg.data.value);
+    if(logical === ONLINE_SCOPE.userIndexKey && _currentView === 'scoreboard') _fetchAllUsers(true);
+  });
+
+  const chatCh = _ablyChannel('chat');
+  chatCh.subscribe('msg', msg=>{
+    const m=msg.data;
+    if(!m||!m.ts||!m.author) return;
+    const now=Date.now();
+    const exists=_chatMsgs.some(x=>x.ts===m.ts&&x.author===m.author);
+    if(!exists){
+      _chatMsgs.push(m);
+      _chatMsgs=_chatMsgs.filter(x=>(now-x.ts)<CHAT_TTL).slice(-CHAT_MAX);
+      _chatMsgs.sort((a,b)=>a.ts-b.ts);
+      if(_chatOpen){ chatRenderMessages(); _chatMarkRead(); }
+      else{
+        const me=_currentUser?.name;
+        if(m.author!==me&&m.ts>_chatLastSeen){ _chatUnread++; _chatRefreshBadge(); }
+      }
+    }
+  });
+  setTimeout(()=>_loadChatHistory(),500);
+
+  const presenceCh = _ablyChannel('presence');
+  presenceCh.presence.subscribe(member=>_onPresenceEvent(member));
+
+  const duelCh = _ablyChannel('duels');
+  duelCh.subscribe('invite', msg=>{
+    if(!_currentUser) return;
+    const inv=msg.data;
+    if(inv?.to===_currentUser.name && !_duelState) _showDuelNotifBanner(inv.from, inv.key);
+  });
+  duelCh.subscribe('accept', msg=>{
+    if(!_currentUser) return;
+    const acc=msg.data;
+    if(acc?.to===_currentUser.name && _duelState?.role==='challenger'){
+      clearTimeout(_duelState._timeout);
+      document.getElementById('duel-modal')?.remove();
+      startDuelGame(acc.from);
+    }
+  });
+  duelCh.subscribe('decline', msg=>{
+    if(!_currentUser) return;
+    const data = msg.data || {};
+    if(data.to===_currentUser.name && _duelState?.role==='challenger'){
+      clearTimeout(_duelState._timeout);
+      _duelState=null;
+      document.getElementById('duel-modal')?.remove();
+      _showToast(data.from+' a refusé le duel.', 'var(--red)');
+    }
+  });
+  duelCh.subscribe('result', msg=>{
+    if(!_currentUser||!_duelState) return;
+    if(msg.data?.player!==_currentUser.name) _onOpponentDuelResult(msg.data);
+  });
 }
 
 async function ablyInit(){
-  return new Promise(resolve=>{
-    if(typeof Ably!=='undefined'){ _setupAbly(resolve); return; }
+  if(_ablyInitPromise) return _ablyInitPromise;
+  _ablyInitPromise = new Promise(resolve=>{
+    const boot = ()=>_setupAbly(resolve);
+    if(typeof Ably!=='undefined'){ boot(); return; }
+    const existing = document.querySelector('script[data-ably-loader="1"]');
+    if(existing){
+      existing.addEventListener('load', boot, {once:true});
+      existing.addEventListener('error', ()=>resolve(), {once:true});
+      return;
+    }
     const s=document.createElement('script');
     s.src='https://cdn.ably.com/lib/ably.min-2.js';
-    s.onload=()=>_setupAbly(resolve);
+    s.dataset.ablyLoader = '1';
+    s.onload=boot;
     s.onerror=()=>{ console.warn('Ably load failed'); resolve(); };
     document.head.appendChild(s);
   });
+  return _ablyInitPromise;
 }
 
 function _setupAbly(resolve){
   try{
-    _ably=new Ably.Realtime({key:ABLY_KEY, clientId:'frise-anon-'+Math.random().toString(36).slice(2,8)});
-    _ably.connection.on('connected', async()=>{
-      _ablyReady=true;
-
-      // Canal KV — données persistantes (scores, duels, index)
-      const kvCh=_ablyChannel('frise:kv');
-      kvCh.subscribe('set', msg=>{
-        const {key,value}=msg.data;
-        _kv[key]=value;
-        if(key.startsWith('frise_users:')&&key!=='frise_users:index') _onAblyUserUpdate(value);
-        // NE PAS traiter CHAT_KEY ici — le chat a son propre canal frise:chat
-      });
-
-      // Canal Chat — pub/sub pur (pas de KV, pas de read-modify-write)
-      const chatCh=_ablyChannel('frise:chat');
-      chatCh.subscribe('msg', msg=>{
-        const m=msg.data;
-        if(!m||!m.ts||!m.author) return;
-        const now=Date.now();
-        const exists=_chatMsgs.some(x=>x.ts===m.ts&&x.author===m.author);
-        if(!exists){
-          _chatMsgs.push(m);
-          _chatMsgs=_chatMsgs.filter(x=>(now-x.ts)<CHAT_TTL).slice(-CHAT_MAX);
-          _chatMsgs.sort((a,b)=>a.ts-b.ts);
-          if(_chatOpen){ chatRenderMessages(); _chatMarkRead(); }
-          else{
-            const me=_currentUser?.name;
-            if(m.author!==me&&m.ts>_chatLastSeen){ _chatUnread++; _chatRefreshBadge(); }
-          }
-        }
-      });
-      // Charger l'historique chat au démarrage
-      setTimeout(()=>_loadChatHistory(),500);
-
-      // Canal Présence — compteur temps réel
-      const presenceCh=_ablyChannel('frise:presence');
-      presenceCh.presence.subscribe(m=>_onPresenceEvent(m));
-      try{
-        const members=await presenceCh.presence.get();
-        _presenceMembers={};
-        members.forEach(m=>{ if(m.data&&m.data.name) _presenceMembers[m.data.name]=m.data; });
-        updateOnlineCount();
-      }catch(e){}
-
-      // Canal Duels — invitations push
-      const duelCh=_ablyChannel('frise:duels');
-      duelCh.subscribe('invite', msg=>{
-        if(!_currentUser) return;
-        const inv=msg.data;
-        if(inv.to===_currentUser.name&&!_duelState) _showDuelNotifBanner(inv.from, inv.key);
-      });
-      duelCh.subscribe('accept', msg=>{
-        if(!_currentUser) return;
-        const acc=msg.data;
-        if(acc.to===_currentUser.name&&_duelState?.role==='challenger'){
-          clearTimeout(_duelState._timeout);
-          document.getElementById('duel-modal')?.remove();
-          startDuelGame(acc.from);
-        }
-      });
-      duelCh.subscribe('decline', msg=>{
-        if(!_currentUser) return;
-        if(msg.data.to===_currentUser.name&&_duelState?.role==='challenger'){
-          clearTimeout(_duelState._timeout);
-          _duelState=null;
-          document.getElementById('duel-modal')?.remove();
-          _showToast(msg.data.from+' a refusé le duel.', 'var(--red)');
-        }
-      });
-      duelCh.subscribe('result', msg=>{
-        if(!_currentUser||!_duelState) return;
-        if(msg.data.player!==_currentUser.name) _onOpponentDuelResult(msg.data);
-      });
-
-      resolve();
+    if(_ably){ resolve(); return; }
+    _ably = new Ably.Realtime({
+      key: ABLY_KEY,
+      clientId: `${ONLINE_SCOPE.clientPrefix}-anon-${Math.random().toString(36).slice(2,8)}`
     });
-    _ably.connection.on('failed',()=>{ console.warn('Ably failed'); resolve(); });
-    _ably.connection.on('disconnected',()=>{ _ablyReady=false; });
-    _ably.connection.on('connected',()=>{ _ablyReady=true; _syncPresence(true); });
+
+    let resolved = false;
+    const done = ()=>{ if(!resolved){ resolved = true; resolve(); } };
+
+    _ably.connection.on(async stateChange=>{
+      const state = stateChange?.current || stateChange;
+      if(state === 'connected'){
+        _ablyReady = true;
+        await _subscribeRealtimeChannels();
+        await _bootstrapKvFromHistory();
+        await _refreshPresenceSnapshot();
+        await _syncPresence(true);
+        if(_currentView==='scoreboard') _fetchAllUsers(true);
+        done();
+      }else if(state === 'failed'){
+        _ablyReady = false;
+        console.warn('Ably failed');
+        done();
+      }else if(['disconnected','suspended','closing','closed'].includes(state)){
+        _ablyReady = false;
+        updateOnlineCount();
+      }
+    });
   }catch(e){ console.warn('Ably setup error:',e); resolve(); }
 }
 
 async function _presenceEnter(){
   if(!_ablyReady||!_currentUser) return;
   try{
-    const ch=_ablyChannel('frise:presence');
-    const data={name:_currentUser.name,color:_currentUser.color,ts:Date.now()};
+    const ch=_ablyChannel('presence');
+    const data={
+      name:_currentUser.name,
+      color:_currentUser.color,
+      ts:Date.now(),
+      view:_currentView || 'scoreboard'
+    };
     if(_presenceJoined){
       try{ await ch.presence.update(data); }catch(e){}
       return;
@@ -4080,63 +4234,75 @@ async function _presenceEnter(){
 async function _presenceLeave(){
   if(!_ablyReady){ _presenceJoined=false; return; }
   if(!_presenceJoined && !_currentUser) return;
-  try{ await _ablyChannel('frise:presence').presence.leave(); }catch(e){}
+  try{ await _ablyChannel('presence').presence.leave(); }catch(e){}
   _presenceJoined=false;
   if(_currentUser) delete _presenceMembers[_currentUser.name];
   updateOnlineCount();
 }
 
 function _onPresenceEvent(member){
-  if(!member.data||!member.data.name) return;
-  const _pname=member.data.name;
-  if(member.action==='leave'||member.action==='absent') delete _presenceMembers[_pname];
-  else _presenceMembers[_pname]=member.data;
+  if(!member?.data?.name) return;
+  const name = member.data.name;
+  if(member.action==='leave'||member.action==='absent') delete _presenceMembers[name];
+  else _presenceMembers[name]=member.data;
   updateOnlineCount();
+  if(_currentView==='scoreboard'){
+    const sbContent=document.getElementById('sb-content');
+    if(sbContent) sbRenderList(sbContent,_usersCache);
+  }
 }
 
 function _onAblyUserUpdate(value){
   try{
     const u=JSON.parse(value);
-    const isActive = u && u.scoreboardActive !== false;
+    if(!u?.name) return;
+    const isActive = u.scoreboardActive !== false;
     const idx=_usersCache.findIndex(x=>x.name===u.name);
     if(isActive){
       if(idx>=0) _usersCache[idx]=u; else _usersCache.push(u);
-    } else if(idx>=0){
+    }else if(idx>=0){
       _usersCache.splice(idx,1);
     }
-    _usersCache.sort((a,b)=>(b.scores?.total||0)-(a.scores?.total||0));
+    _usersCache.sort((a,b)=>{
+      const scoreDiff = (b.scores?.total||0)-(a.scores?.total||0);
+      if(scoreDiff) return scoreDiff;
+      const duelDiff = (b.duelsWon||0)-(a.duelsWon||0);
+      if(duelDiff) return duelDiff;
+      return (b.lastSeen||0)-(a.lastSeen||0);
+    });
     _usersCacheTs=Date.now();
     const sbContent=document.getElementById('sb-content');
     if(sbContent && _currentView==='scoreboard') sbRenderList(sbContent,_usersCache);
   }catch(e){}
 }
 
-
-
 // ── Storage wrappers ────────────────────────────────────────────
 async function storageSet(key,value,shared){
-  _kv[key]=value;
-  // Persister localement les clés critiques (fallback si Ably history expire)
-  if(key==='frise_users:index'||key.startsWith('frise_users:')){
-    try{ localStorage.setItem('_frise_kv_'+key,value); }catch(e){}
-  }
-  if(_ablyReady) try{ await _ablyChannel('frise:kv').publish('set',{key,value}); }catch(e){}
-  return {key,value};
+  const logical = _normalizeLogicalKey(key);
+  const physical = _physicalKvKey(logical);
+  _kv[logical]=value;
+  _persistCriticalKv(logical, value);
+  if(_ablyReady) try{ await _ablyChannel('kv').publish('set',{key:physical,value}); }catch(e){}
+  return {key:logical,value};
 }
 async function storageGet(key,shared){
-  if(_kv[key]!==undefined) return {key,value:_kv[key]};
-  // Fallback localStorage pour clés critiques
-  try{
-    const ls=localStorage.getItem('_frise_kv_'+key);
-    if(ls){ _kv[key]=ls; return {key,value:ls}; }
-  }catch(e){}
-  // Ably history paginée
+  const logical = _normalizeLogicalKey(key);
+  if(_kv[logical]!==undefined) return {key:logical,value:_kv[logical]};
+
+  const local = _restoreCriticalKv(logical);
+  if(local!==null){ _kv[logical]=local; return {key:logical,value:local}; }
+
   if(_ablyReady){
     try{
-      let page=await _ablyChannel('frise:kv').history({limit:1000,direction:'backwards'});
+      const wanted = _physicalKvKey(logical);
+      let page=await _ablyChannel('kv').history({limit:1000,direction:'backwards'});
       do{
         for(const msg of (page?.items||[])){
-          if(msg.name==='set'&&msg.data?.key===key){ _kv[key]=msg.data.value; return {key,value:msg.data.value}; }
+          if(msg.name==='set' && msg.data?.key===wanted){
+            _kv[logical]=msg.data.value;
+            _persistCriticalKv(logical, msg.data.value);
+            return {key:logical,value:msg.data.value};
+          }
         }
         if(page?.hasNext()) page=await page.next(); else break;
       }while(page);
@@ -4145,22 +4311,9 @@ async function storageGet(key,shared){
   return null;
 }
 async function storageList(prefix,shared){
-  if(_ablyReady){
-    try{
-      let page=await _ablyChannel('frise:kv').history({limit:1000,direction:'backwards'});
-      const seen=new Set();
-      do{
-        for(const msg of (page?.items||[])){
-          if(msg.name==='set'&&msg.data?.key&&!seen.has(msg.data.key)){
-            seen.add(msg.data.key);
-            _kv[msg.data.key]=msg.data.value;
-          }
-        }
-        if(page?.hasNext()) page=await page.next(); else break;
-      }while(page);
-    }catch(e){}
-  }
-  return {keys:Object.keys(_kv).filter(k=>k.startsWith(prefix))};
+  if(_ablyReady) await _bootstrapKvFromHistory();
+  const logicalPrefix = _normalizeLogicalKey(prefix);
+  return {keys:Object.keys(_kv).filter(k=>k.startsWith(logicalPrefix))};
 }
 
 // ── Heartbeat ───────────────────────────────────────────────────
@@ -4208,7 +4361,6 @@ async function _runPoll(){
   _pollRunning=true;
   try{
     if(_currentUser&&_ablyReady) await sbPushMyStats();
-    // chatPoll supprimé — chat géré par frise:chat subscribe
   }catch(e){}finally{ _pollRunning=false; }
 }
 
@@ -4218,11 +4370,17 @@ async function _fetchAllUsers(force=false){
   const ttl=document.hidden?USERS_CACHE_TTL_BG:_chatOpen?USERS_CACHE_TTL_ACTIVE:USERS_CACHE_TTL_NORMAL;
   if(!force&&_usersCache.length&&(now-_usersCacheTs)<ttl) return _usersCache;
   try{
-    const idxRaw=await storageGet('frise_users:index',true);
-    if(!idxRaw) return _usersCache;
-    const idx=JSON.parse(idxRaw.value);
-    if(!idx.keys?.length) return _usersCache;
-    const raws=await Promise.all(idx.keys.map(k=>storageGet(k,true).catch(()=>null)));
+    const idxRaw=await storageGet(ONLINE_SCOPE.userIndexKey,true);
+    let keys=[];
+    if(idxRaw){
+      const idx=JSON.parse(idxRaw.value||'{}');
+      if(Array.isArray(idx.keys)) keys = idx.keys.slice();
+    }
+    if(!keys.length){
+      keys = Object.keys(_kv).filter(k=>k.startsWith('players:'));
+    }
+    const uniqKeys = [...new Set(keys.filter(Boolean))];
+    const raws=await Promise.all(uniqKeys.map(k=>storageGet(k,true).catch(()=>null)));
     const users=[];
     raws.forEach(raw=>{
       if(raw) try{
@@ -4230,7 +4388,13 @@ async function _fetchAllUsers(force=false){
         if(u && u.scoreboardActive !== false) users.push(u);
       }catch(e){}
     });
-    _usersCache=users.sort((a,b)=>(b.scores?.total||0)-(a.scores?.total||0));
+    _usersCache=users.sort((a,b)=>{
+      const scoreDiff=(b.scores?.total||0)-(a.scores?.total||0);
+      if(scoreDiff) return scoreDiff;
+      const duelDiff=(b.duelsWon||0)-(a.duelsWon||0);
+      if(duelDiff) return duelDiff;
+      return (b.lastSeen||0)-(a.lastSeen||0);
+    });
     _usersCacheTs=now;
     const sbContent=document.getElementById('sb-content');
     if(sbContent && _currentView==='scoreboard') sbRenderList(sbContent,_usersCache);
@@ -4250,26 +4414,30 @@ async function sbPushMyStats(extra={}){
     const prev=await storageGet(_currentUser.key,true);
     const prevData=prev?JSON.parse(prev.value):{};
     const userData=Object.assign({},prevData,{
-      name:_currentUser.name, color:_currentUser.color,
+      name:_currentUser.name,
+      color:_currentUser.color,
       pwHash:_currentUser.pwHash||prevData.pwHash||'',
-      lastSeen:Date.now(), online:_shouldBePresent(), scoreboardActive:true,
-      scores, streak:getStreak(),
+      lastSeen:Date.now(),
+      online:_shouldBePresent(),
+      scoreboardActive:true,
+      scores,
+      streak:getStreak(),
       bestStreak:Math.max(_getStoredBestStreak(),prevData.bestStreak||0),
       duelsWon:Math.max(prevData.duelsWon||0,extra.duelsWon||0),
       duelsPlayed:Math.max(prevData.duelsPlayed||0,extra.duelsPlayed||0),
     },extra);
     await storageSet(_currentUser.key,JSON.stringify(userData),true);
-    if(!_sbUserIndexed){
-      const idxRaw=await storageGet('frise_users:index',true);
-      const idx=idxRaw?JSON.parse(idxRaw.value):{keys:[]};
-      if(!idx.keys.includes(_currentUser.key)){ idx.keys.push(_currentUser.key); await storageSet('frise_users:index',JSON.stringify(idx),true); }
-      _sbUserIndexed=true;
-    }
+
+    const idxRaw=await storageGet(ONLINE_SCOPE.userIndexKey,true);
+    const idx=idxRaw?JSON.parse(idxRaw.value):{keys:[]};
+    if(!Array.isArray(idx.keys)) idx.keys=[];
+    if(!idx.keys.includes(_currentUser.key)) idx.keys.push(_currentUser.key);
+    await storageSet(ONLINE_SCOPE.userIndexKey,JSON.stringify(idx),true);
+    _sbUserIndexed=true;
   }catch(e){}finally{ _sbPushInProgress=false; }
 }
 
 async function sbSetOffline(){
-  // Marque offline dans KV sans retirer du scoreboard
   if(!_currentUser||!_ablyReady) return;
   try{
     const prev=await storageGet(_currentUser.key,true);
@@ -4290,11 +4458,9 @@ async function sbRefresh(){
 
 // ── Compteur en ligne (Ably Presence natif) ─────────────────────
 function updateOnlineCount(){
-  // SOURCE UNIQUE : Ably Presence — appliqué à TOUS les indicateurs
   const members = Object.values(_presenceMembers);
   const n = members.length;
 
-  // Topbar counter + dot
   const el = document.getElementById('tp-online-n');
   if(el) el.textContent = n>0 ? n : '—';
   const dot = document.getElementById('tp-online-dot');
@@ -4304,30 +4470,25 @@ function updateOnlineCount(){
     dot.style.animation = n>0 ? 'pulse-online 2s ease-in-out infinite' : 'none';
   }
 
-  // Tooltip hover — liste des connectés
   const avatarsEl = document.getElementById('tp-online-avatars');
   if(avatarsEl){
     avatarsEl.innerHTML = n===0
-      ? '<span style="font-family:DM Mono,monospace;font-size:9px;color:var(--t4)">Personne En ligne</span>'
+      ? '<span style="font-family:DM Mono,monospace;font-size:9px;color:var(--t4)">Personne en ligne</span>'
       : members.slice(0,8).map(u=>`<div style="display:flex;align-items:center;gap:7px;margin-bottom:3px"><div style="width:16px;height:16px;border-radius:50%;background:${u.color||'var(--navy)'};display:flex;align-items:center;justify-content:center;font-family:DM Mono,monospace;font-size:7px;font-weight:700;color:#fff">${(u.name||'?')[0].toUpperCase()}</div><span style="font-family:DM Mono,monospace;font-size:9px;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:90px">${u.name}</span><span style="width:6px;height:6px;background:#2ecc71;border-radius:50%;margin-left:auto;box-shadow:0 0 4px #2ecc71"></span></div>`).join('')
         + (n>8?`<div style="font-family:DM Mono,monospace;font-size:8px;color:var(--t4);margin-top:2px">+${n-8} autres</div>`:'');
   }
 
-  // Scoreboard counter
   const sbEl = document.getElementById('sb-online-count');
-  if(sbEl) sbEl.textContent = n>0 ? n+' utilisateur'+(n>1?'s':'')+' En ligne' : 'Aucun utilisateur En ligne';
+  if(sbEl) sbEl.textContent = n>0 ? n+' utilisateur'+(n>1?'s':'')+' en ligne' : 'Aucun utilisateur en ligne';
 
-  // Sidebar footer
   const sbFoot = document.getElementById('sb-online-foot');
-  if(sbFoot){ sbFoot.textContent = n>0 ? n+' En ligne' : 'hors ligne'; sbFoot.style.color = n>0 ? '#2ecc71' : 'var(--t4)'; }
+  if(sbFoot){ sbFoot.textContent = n>0 ? n+' en ligne' : 'hors ligne'; sbFoot.style.color = n>0 ? '#2ecc71' : 'var(--t4)'; }
 
-  // Chat pill
   const pill = document.getElementById('chat-online-pill');
-  if(pill){ pill.textContent = n>0 ? n+' En ligne' : 'hors ligne'; pill.style.color = n>0 ? '#2ecc71' : 'var(--t4)'; }
+  if(pill){ pill.textContent = n>0 ? n+' en ligne' : 'hors ligne'; pill.style.color = n>0 ? '#2ecc71' : 'var(--t4)'; }
 
   _chatRefreshBadge();
 
-  // Badges inline scoreboard (sans re-render complet)
   const presenceNames = _getPresenceNames();
   const sbContent = document.querySelector('#sb-content .sb-user-list, #sb-content > div');
   if(sbContent){
@@ -4380,6 +4541,7 @@ async function sbLogin(name, password=''){
   _currentUser={name,color,key,pwHash};
   localStorage.setItem('prepa_username',name);
   if(pwHash) localStorage.setItem('prepa_pwhash',pwHash);
+  else localStorage.removeItem('prepa_pwhash');
 
   _sbUserIndexed=false;
   _presenceDesired=false;
@@ -4434,7 +4596,7 @@ function showLoginModal(){
   modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:1000';
   modal.innerHTML=`<div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:32px 36px;width:340px;box-shadow:0 20px 60px rgba(0,0,0,.4)">
     <div style="font-family:'Cormorant Garamond',serif;font-size:22px;font-weight:600;margin-bottom:4px">Connexion</div>
-    <div style="font-family:'DM Mono',monospace;font-size:10px;color:var(--t4);margin-bottom:20px;line-height:1.6">Pseudo + mot de passe optionnel pour sync multi-appareils.</div>
+    <div style="font-family:'DM Mono',monospace;font-size:10px;color:var(--t4);margin-bottom:20px;line-height:1.6">Pseudo + mot de passe optionnel pour synchroniser ton compte sur tous tes appareils.</div>
     <div style="display:flex;flex-direction:column;gap:10px">
       <input id="sb-name-input" type="text" maxlength="20" placeholder="Pseudo…"
         style="width:100%;padding:10px 14px;background:var(--s2);border:1px solid var(--bd);border-radius:8px;color:var(--fg);font-size:14px;font-family:'DM Sans',sans-serif;outline:none;box-sizing:border-box"
@@ -4446,7 +4608,7 @@ function showLoginModal(){
         <button onclick="const i=document.getElementById('sb-pw-input');i.type=i.type==='password'?'text':'password'" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--t4);cursor:pointer;font-size:13px">👁</button>
       </div>
       <div id="sb-login-error" style="display:none;font-family:'DM Mono',monospace;font-size:10px;color:var(--red);padding:6px 10px;background:rgba(209,82,72,.08);border-radius:5px;border:1px solid rgba(209,82,72,.2)"></div>
-      <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--t4)">Pseudo visible de tous · Sans mdp = accès libre</div>
+      <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--t4)">Le pseudo est public · Le profil reste visible dans le scoreboard jusqu'à la déconnexion.</div>
       <div style="font-family:'DM Mono',monospace;font-size:9px;color:#d08040;padding:6px 10px;background:rgba(208,128,64,.08);border-radius:5px;border:1px solid rgba(208,128,64,.2)">⚠️ N'utilise pas un mot de passe personnel</div>
     </div>
     <div style="display:flex;gap:8px;margin-top:18px">
@@ -4470,28 +4632,18 @@ async function sbLoginFromModal(){
 
 async function initUser(){
   await ablyInit();
-  // Bootstrap 1 : localStorage (instantané, nos propres données)
   try{
     for(let i=0;i<localStorage.length;i++){
-      const k=localStorage.key(i);
-      if(k&&k.startsWith('_frise_kv_')){ const rk=k.slice(10); if(_kv[rk]===undefined) _kv[rk]=localStorage.getItem(k); }
+      const rawKey=localStorage.key(i);
+      const logical=_extractLogicalKeyFromLocalStorageKey(rawKey);
+      if(logical && _kv[logical]===undefined){
+        const value=localStorage.getItem(rawKey);
+        if(value!==null) _kv[logical]=value;
+      }
     }
   }catch(e){}
-  // Bootstrap 2 : Ably history paginée (données de tous les users)
   if(_ablyReady){
-    try{
-      let page=await _ablyChannel('frise:kv').history({limit:1000,direction:'backwards'});
-      const seen=new Set(Object.keys(_kv));
-      do{
-        for(const msg of (page?.items||[])){
-          if(msg.name==='set'&&msg.data?.key&&!seen.has(msg.data.key)){
-            seen.add(msg.data.key);
-            _kv[msg.data.key]=msg.data.value;
-          }
-        }
-        if(page?.hasNext()) page=await page.next(); else break;
-      }while(page);
-    }catch(e){ console.warn('[initUser] bootstrap error:',e); }
+    await _bootstrapKvFromHistory(true);
     updateOnlineCount();
   }
   const saved=localStorage.getItem('prepa_username');
@@ -4523,6 +4675,8 @@ function duelKey(a,b){ return 'frise_duel:'+sbUserKey(a)+':'+sbUserKey(b); }
 
 async function sbRequestDuel(targetName){
   if(!_currentUser||!_ablyReady) return;
+  if(_duelState){ _showToast('Un duel est déjà en cours.', 'var(--red)'); return; }
+  if(!isUserOnline(targetName)){ _showToast(targetName+" n'est pas en ligne.", 'var(--red)'); return; }
   const key=duelKey(_currentUser.name,targetName);
   // Afficher écran d'attente
   sbShowDuelWaiting(targetName, key);
@@ -4830,7 +4984,7 @@ function _startDuelAblyPush(opponentName){
   const kvCh=_ablyChannel('frise:kv');
   if(kvCh){
     kvCh.subscribe('set', async (msg)=>{
-      if(!msg.data||msg.data.key!==_duelResultKey) return;
+      if(!msg.data || !_matchesStorageEventKey(msg.data.key, _duelResultKey)) return;
       if(_duelFinished) return;
       try{
         const res=JSON.parse(msg.data.value);
