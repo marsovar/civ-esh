@@ -3889,7 +3889,7 @@ function loadQuizConfig(){
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  ONLINE — SYSTÈME EN LIGNE v31 (Ably reconstruit)
+//  ONLINE — SYSTÈME EN LIGNE v32 (Ably reconstruit)
 //  Namespace Ably dédié à ce site pour éviter tout conflit avec d'autres projets.
 //  • Scoreboard persistant (hors ligne visible tant que pas de déconnexion)
 //  • Présence temps réel séparée du stockage des comptes
@@ -3923,27 +3923,27 @@ const USER_COLORS = ['#2a7a8f','#2d7a5f','#c0392b','#6b4fa8','#b8922a','#1a6a9a'
 const ABLY_KEY = 'omrAsg.61E1oQ:sJXWtnTzOlCdLP2t44fhmBB1RyMPURSJQJLNOPwccR8';
 
 const ONLINE_SCOPE = Object.freeze({
-  app: 'esh-scoreboard-v1',
-  clientPrefix: 'eshsb',
-  localPrefix: '__esh_scoreboard_v1__',
+  app: 'esh-economie-live-v2',
+  clientPrefix: 'esheco',
+  localPrefix: '__esh_economie_live_v2__',
   channels: {
-    kv: 'esh-scoreboard-v1:state',
-    chat: 'esh-scoreboard-v1:chat',
-    presence: 'esh-scoreboard-v1:presence',
-    duels: 'esh-scoreboard-v1:duels'
+    kv: 'esh-economie-live-v2:state',
+    chat: 'esh-economie-live-v2:chat',
+    presence: 'esh-economie-live-v2:presence',
+    duels: 'esh-economie-live-v2:duels'
   },
   aliases: {
-    'frise:kv': 'esh-scoreboard-v1:state',
-    'ecg:kv': 'esh-scoreboard-v1:state',
-    'frise:chat': 'esh-scoreboard-v1:chat',
-    'ecg:chat': 'esh-scoreboard-v1:chat',
-    'frise:presence': 'esh-scoreboard-v1:presence',
-    'ecg:presence': 'esh-scoreboard-v1:presence',
-    'frise:duels': 'esh-scoreboard-v1:duels',
-    'ecg:duels': 'esh-scoreboard-v1:duels'
+    'frise:kv': 'esh-economie-live-v2:state',
+    'ecg:kv': 'esh-economie-live-v2:state',
+    'frise:chat': 'esh-economie-live-v2:chat',
+    'ecg:chat': 'esh-economie-live-v2:chat',
+    'frise:presence': 'esh-economie-live-v2:presence',
+    'ecg:presence': 'esh-economie-live-v2:presence',
+    'frise:duels': 'esh-economie-live-v2:duels',
+    'ecg:duels': 'esh-economie-live-v2:duels'
   },
   userIndexKey: 'players:index',
-  kvPrefix: 'esh-scoreboard-v1:kv:'
+  kvPrefix: 'esh-economie-live-v2:kv:'
 });
 
 // Tab focus
@@ -4006,6 +4006,27 @@ function _extractLogicalKeyFromLocalStorageKey(rawKey){
   return null;
 }
 
+function _userPresenceKey(input){
+  if(!input) return '';
+  if(typeof input === 'string') return sbUserKey(input);
+  if(input.userKey) return input.userKey;
+  if(input.key) return input.key;
+  return sbUserKey(input.name||'');
+}
+function _presencePayload(){
+  if(!_currentUser) return null;
+  return {
+    userKey: _currentUser.key,
+    name: _currentUser.name,
+    color: _currentUser.color,
+    ts: Date.now(),
+    view: _currentView || 'scoreboard'
+  };
+}
+function _getPresenceUserKeys(){
+  return new Set(Object.keys(_presenceMembers));
+}
+
 function _shouldBePresent(){
   // Un joueur est considéré en ligne tant qu'il est connecté avec son compte
   // et que la connexion Ably est active. On ne dépend plus du focus/visibility,
@@ -4023,8 +4044,8 @@ async function _syncPresence(force=false){
 
 function sbUserKey(name){ return 'players:' + _safeSlug(name); }
 function isOnline(u){ return u && isUserOnline(u.name); }
-function isUserOnline(name){ return !!_presenceMembers[name]; }
-function _getPresenceNames(){ return new Set(Object.keys(_presenceMembers)); }
+function isUserOnline(name){ return !!_presenceMembers[_userPresenceKey(name)]; }
+function _getPresenceNames(){ return new Set(Object.values(_presenceMembers).map(m=>m.name).filter(Boolean)); }
 function isOnlinePres(u){ return u && isUserOnline(u.name); }
 function formatLastSeen(ts){
   if(!ts) return 'jamais';
@@ -4086,8 +4107,17 @@ async function _refreshPresenceSnapshot(){
     const members = await _ablyChannel('presence').presence.get();
     const next = {};
     (members||[]).forEach(member=>{
-      if(member?.data?.name) next[member.data.name] = member.data;
+      const data = member?.data;
+      const key = _userPresenceKey(data);
+      if(data?.name && key) next[key] = Object.assign({}, data, { userKey: key });
     });
+    if(_currentUser && _presenceDesired && _ablyReady){
+      const selfKey = _userPresenceKey(_currentUser);
+      if(selfKey && !next[selfKey]){
+        const optimistic = _presencePayload();
+        if(optimistic) next[selfKey] = optimistic;
+      }
+    }
     _presenceMembers = next;
     updateOnlineCount();
   }catch(e){}
@@ -4204,10 +4234,15 @@ function _setupAbly(resolve){
         done();
       }else if(state === 'failed'){
         _ablyReady = false;
+        _presenceJoined = false;
+        _presenceMembers = {};
+        updateOnlineCount();
         console.warn('Ably failed');
         done();
       }else if(['disconnected','suspended','closing','closed'].includes(state)){
         _ablyReady = false;
+        _presenceJoined = false;
+        _presenceMembers = {};
         updateOnlineCount();
       }
     });
@@ -4218,16 +4253,12 @@ async function _presenceEnter(){
   if(!_ablyReady||!_currentUser) return;
   try{
     const ch=_ablyChannel('presence');
-    const data={
-      name:_currentUser.name,
-      color:_currentUser.color,
-      ts:Date.now(),
-      view:_currentView || 'scoreboard'
-    };
+    const data=_presencePayload();
+    if(!data) return;
 
     // Mise à jour optimiste locale : on ne dépend pas uniquement du retour
     // d'événement de présence pour s'afficher soi-même en ligne.
-    _presenceMembers[_currentUser.name] = data;
+    _presenceMembers[data.userKey] = data;
     updateOnlineCount();
 
     if(_presenceJoined){
@@ -4254,15 +4285,16 @@ async function _presenceLeave(){
   if(!_presenceJoined && !_currentUser) return;
   try{ await _ablyChannel('presence').presence.leave(); }catch(e){}
   _presenceJoined=false;
-  if(_currentUser) delete _presenceMembers[_currentUser.name];
+  if(_currentUser) delete _presenceMembers[_userPresenceKey(_currentUser)];
   updateOnlineCount();
 }
 
 function _onPresenceEvent(member){
   if(!member?.data?.name) return;
-  const name = member.data.name;
-  if(member.action==='leave'||member.action==='absent') delete _presenceMembers[name];
-  else _presenceMembers[name]=member.data;
+  const key = _userPresenceKey(member.data);
+  if(!key) return;
+  if(member.action==='leave'||member.action==='absent') delete _presenceMembers[key];
+  else _presenceMembers[key]=Object.assign({}, member.data, { userKey: key });
   updateOnlineCount();
   if(_currentView==='scoreboard'){
     const sbContent=document.getElementById('sb-content');
@@ -4274,6 +4306,7 @@ function _onAblyUserUpdate(value){
   try{
     const u=JSON.parse(value);
     if(!u?.name) return;
+    u.key = u.key || sbUserKey(u.name);
     const isActive = u.scoreboardActive !== false;
     const idx=_usersCache.findIndex(x=>x.name===u.name);
     if(isActive){
@@ -4342,6 +4375,11 @@ function _getAdaptiveInterval(){
   return POLL_INTERVAL_NORMAL;
 }
 
+async function _touchPresence(){
+  if(!_ablyReady || !_currentUser || !_presenceJoined) return;
+  try{ await _ablyChannel('presence').presence.update(_presencePayload()); }catch(e){}
+}
+
 function sbStartHeartbeat(){
   if(_onlineHeartbeat) clearTimeout(_onlineHeartbeat);
   _runPoll();
@@ -4370,6 +4408,8 @@ window.addEventListener('pagehide',()=>{ _presenceDesired=false; _presenceLeave(
 document.addEventListener('visibilitychange',_handlePresenceVisibilityChange);
 window.addEventListener('focus',()=>{ _tabFocused=!document.hidden; sbPushMyStats(); if(_currentUser&&_ablyReady) _presenceEnter(); });
 window.addEventListener('blur', ()=>{ _tabFocused=false; sbPushMyStats(); });
+window.addEventListener('online', ()=>{ if(_currentUser){ _usersCacheTs=0; if(_ablyReady) _syncPresence(true); } });
+window.addEventListener('offline', ()=>{ _presenceJoined=false; _presenceMembers={}; updateOnlineCount(); });
 function sbStopHeartbeat(){
   if(_onlineHeartbeat){ clearTimeout(_onlineHeartbeat); _onlineHeartbeat=null; }
 }
@@ -4379,7 +4419,11 @@ async function _runPoll(){
   if(_pollRunning) return;
   _pollRunning=true;
   try{
-    if(_currentUser&&_ablyReady) await sbPushMyStats();
+    if(_currentUser&&_ablyReady){
+      await sbPushMyStats();
+      await _touchPresence();
+      if(!_presenceJoined) await _syncPresence(true);
+    }
   }catch(e){}finally{ _pollRunning=false; }
 }
 
@@ -4404,7 +4448,10 @@ async function _fetchAllUsers(force=false){
     raws.forEach(raw=>{
       if(raw) try{
         const u=JSON.parse(raw.value);
-        if(u && u.scoreboardActive !== false) users.push(u);
+        if(u && u.scoreboardActive !== false){
+          u.key = u.key || sbUserKey(u.name);
+          users.push(u);
+        }
       }catch(e){}
     });
     _usersCache=users.sort((a,b)=>{
@@ -4433,6 +4480,7 @@ async function sbPushMyStats(extra={}){
     const prev=await storageGet(_currentUser.key,true);
     const prevData=prev?JSON.parse(prev.value):{};
     const userData=Object.assign({},prevData,{
+      key:_currentUser.key,
       name:_currentUser.name,
       color:_currentUser.color,
       pwHash:_currentUser.pwHash||prevData.pwHash||'',
@@ -4477,7 +4525,7 @@ async function sbRefresh(){
 
 // ── Compteur en ligne (Ably Presence natif) ─────────────────────
 function updateOnlineCount(){
-  const members = Object.values(_presenceMembers);
+  const members = Object.values(_presenceMembers).filter(Boolean);
   const n = members.length;
 
   const el = document.getElementById('tp-online-n');
@@ -4557,7 +4605,8 @@ async function sbLogin(name, password=''){
   if(existingPwHash&&pwHash!==existingPwHash){ _showLoginError('Mot de passe incorrect.'); return false; }
   if(!color){ const idx=Math.abs(name.split('').reduce((a,ch)=>a+ch.charCodeAt(0),0))%USER_COLORS.length; color=USER_COLORS[idx]; }
 
-  _currentUser={name,color,key,pwHash};
+  const canonicalName = existingData.name || name;
+  _currentUser={name:canonicalName,color,key,pwHash};
   localStorage.setItem('prepa_username',name);
   if(pwHash) localStorage.setItem('prepa_pwhash',pwHash);
   else localStorage.removeItem('prepa_pwhash');
@@ -4569,7 +4618,7 @@ async function sbLogin(name, password=''){
   updateSbUI();
   chatRenderFooter();
   document.getElementById('sb-login-modal')?.remove();
-  Promise.all([sbPushMyStats({scoreboardActive:true}), _syncPresence(true)]).catch(()=>{});
+  Promise.all([sbPushMyStats({scoreboardActive:true}), _syncPresence(true)]).then(()=>_fetchAllUsers(true)).catch(()=>{});
   return true;
 }
 
@@ -4587,6 +4636,7 @@ async function sbLogout(){
       const prev=await storageGet(leavingUser.key,true);
       const prevData=prev?JSON.parse(prev.value):{};
       const nextData=Object.assign({},prevData,{
+        key:leavingUser.key,
         name:leavingUser.name,
         color:leavingUser.color,
         pwHash:leavingUser.pwHash||prevData.pwHash||'',
@@ -4849,11 +4899,12 @@ function sbRenderList(container, users){
   }
   const medals=['🥇','🥈','🥉'];
   // Présence Ably — noms en ligne
-  const presenceNames=new Set(Object.values(_presenceMembers).map(m=>m.name));
+  const presenceKeys=_getPresenceUserKeys();
   let html='<div style="display:flex;flex-direction:column;gap:5px">';
   users.forEach((u,i)=>{
     const isMe=_currentUser&&u.name===_currentUser.name;
-    const online=presenceNames.has(u.name);
+    u.key = u.key || sbUserKey(u.name);
+    const online=presenceKeys.has(u.key) || (isMe && !!_currentUser && _ablyReady);
     const score=u.scores?.total||0;
     const medal=medals[i]||`<span style="font-family:'DM Mono',monospace;color:var(--t4);font-size:10px">#${i+1}</span>`;
     const bg=isMe?`rgba(${hexToRgb(u.color)},0.08)`:'var(--s1)';
