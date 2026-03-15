@@ -3904,7 +3904,7 @@ let _ablyReady = false;
 let _ably = null;
 let _ablyChannels = {};
 let _kv = {};
-let _presenceMembers = {}; // clientId -> {name, color}
+let _presenceMembers = {}; // name -> {name, color, ts}
 let _usersCache = [], _usersCacheTs = 0;
 let _sbPushInProgress = false, _sbUserIndexed = false;
 
@@ -3925,9 +3925,12 @@ window.addEventListener('focus', ()=>{ _tabFocused = true; });
 window.addEventListener('blur', ()=>{ _tabFocused = false; });
 
 function sbUserKey(name){ return 'frise_users:'+name.toLowerCase().replace(/[^a-z0-9]/g,'_'); }
-function isOnline(u){ return u&&u.online&&(Date.now()-(u.lastSeen||0))<ONLINE_TTL; }
+function isOnline(u){ return u && isUserOnline(u.name); } // basé sur Ably Presence
 // SOURCE UNIQUE de présence — même fonction partout
-function _getPresenceNames(){ return new Set(Object.values(_presenceMembers).map(m=>m.name)); }
+// SOURCE UNIQUE présence — _presenceMembers est indexé par NOM
+function isUserOnline(name){ return !!_presenceMembers[name]; }
+function _getPresenceNames(){ return new Set(Object.keys(_presenceMembers)); }
+function isOnlinePres(u){ return u && isUserOnline(u.name); }
 function formatLastSeen(ts){
   if(!ts) return 'jamais';
   const diff=Date.now()-ts, m=Math.floor(diff/60000), h=Math.floor(diff/3600000), d=Math.floor(diff/86400000);
@@ -3964,18 +3967,39 @@ async function ablyInit(){
 
 function _setupAbly(resolve){
   try{
-    _ably=new Ably.Realtime({key:ABLY_KEY, clientId:'frise-'+Math.random().toString(36).slice(2)});
+    _ably=new Ably.Realtime({key:ABLY_KEY, clientId:'frise-anon-'+Math.random().toString(36).slice(2,8)});
     _ably.connection.on('connected', async()=>{
       _ablyReady=true;
 
-      // Canal KV — données persistantes
+      // Canal KV — données persistantes (scores, duels, index)
       const kvCh=_ablyChannel('frise:kv');
       kvCh.subscribe('set', msg=>{
         const {key,value}=msg.data;
         _kv[key]=value;
         if(key.startsWith('frise_users:')&&key!=='frise_users:index') _onAblyUserUpdate(value);
-        if(key===CHAT_KEY) _onAblyChatUpdate(value);
+        // NE PAS traiter CHAT_KEY ici — le chat a son propre canal frise:chat
       });
+
+      // Canal Chat — pub/sub pur (pas de KV, pas de read-modify-write)
+      const chatCh=_ablyChannel('frise:chat');
+      chatCh.subscribe('msg', msg=>{
+        const m=msg.data;
+        if(!m||!m.ts||!m.author) return;
+        const now=Date.now();
+        const exists=_chatMsgs.some(x=>x.ts===m.ts&&x.author===m.author);
+        if(!exists){
+          _chatMsgs.push(m);
+          _chatMsgs=_chatMsgs.filter(x=>(now-x.ts)<CHAT_TTL).slice(-CHAT_MAX);
+          _chatMsgs.sort((a,b)=>a.ts-b.ts);
+          if(_chatOpen){ chatRenderMessages(); _chatMarkRead(); }
+          else{
+            const me=_currentUser?.name;
+            if(m.author!==me&&m.ts>_chatLastSeen){ _chatUnread++; _chatRefreshBadge(); }
+          }
+        }
+      });
+      // Charger l'historique chat au démarrage
+      setTimeout(()=>_loadChatHistory(),500);
 
       // Canal Présence — compteur temps réel
       const presenceCh=_ablyChannel('frise:presence');
@@ -3983,7 +4007,7 @@ function _setupAbly(resolve){
       try{
         const members=await presenceCh.presence.get();
         _presenceMembers={};
-        members.forEach(m=>{ if(m.data) _presenceMembers[m.clientId]=m.data; });
+        members.forEach(m=>{ if(m.data&&m.data.name) _presenceMembers[m.data.name]=m.data; });
         updateOnlineCount();
       }catch(e){}
 
@@ -4029,18 +4053,23 @@ async function _presenceEnter(){
   if(!_ablyReady||!_currentUser) return;
   try{
     const ch=_ablyChannel('frise:presence');
-    const data={name:_currentUser.name,color:_currentUser.color};
-    try{ await ch.presence.update(data); }catch(e){ await ch.presence.enter(data); }
+    const data={name:_currentUser.name,color:_currentUser.color,ts:Date.now()};
+    try{ await ch.presence.enter(data); }
+    catch(e){ try{ await ch.presence.update(data); }catch(e2){} }
   }catch(e){}
 }
 async function _presenceLeave(){
   if(!_ablyReady) return;
   try{ await _ablyChannel('frise:presence').presence.leave(); }catch(e){}
+  if(_currentUser) delete _presenceMembers[_currentUser.name];
+  updateOnlineCount();
 }
 
 function _onPresenceEvent(member){
-  if(member.action==='leave'||member.action==='absent') delete _presenceMembers[member.clientId];
-  else if(member.data) _presenceMembers[member.clientId]=member.data;
+  if(!member.data||!member.data.name) return;
+  const _pname=member.data.name;
+  if(member.action==='leave'||member.action==='absent') delete _presenceMembers[_pname];
+  else _presenceMembers[_pname]=member.data;
   updateOnlineCount();
 }
 
@@ -4054,57 +4083,56 @@ function _onAblyUserUpdate(value){
   }catch(e){}
 }
 
-function _onAblyChatUpdate(value){
-  try{
-    const msgs=JSON.parse(value);
-    const now=Date.now();
-    const fresh=msgs.filter(m=>(now-m.ts)<CHAT_TTL);
-    const changed=fresh.length!==_chatMsgs.length||(fresh.length>0&&_chatMsgs.length>0&&fresh[fresh.length-1].ts!==_chatMsgs[_chatMsgs.length-1].ts);
-    _chatMsgs=fresh;
-    if(changed){
-      if(_chatOpen){ chatRenderMessages(); _chatMarkRead(); }
-      else{
-        const me=_currentUser?.name;
-        const newCount=fresh.filter(m=>m.ts>_chatLastSeen&&m.author!==me).length;
-        if(newCount>_chatUnread){ _chatUnread=newCount; _chatRefreshBadge(); }
-      }
-    }
-    const onlineEl=document.getElementById('chat-online-pill');
-    const n=Object.keys(_presenceMembers).length;
-    if(onlineEl) onlineEl.textContent=n+' En ligne';
-  }catch(e){}
-}
+
 
 // ── Storage wrappers ────────────────────────────────────────────
 async function storageSet(key,value,shared){
   _kv[key]=value;
+  // Persister localement les clés critiques (fallback si Ably history expire)
+  if(key==='frise_users:index'||key.startsWith('frise_users:')){
+    try{ localStorage.setItem('_frise_kv_'+key,value); }catch(e){}
+  }
   if(_ablyReady) try{ await _ablyChannel('frise:kv').publish('set',{key,value}); }catch(e){}
   return {key,value};
 }
 async function storageGet(key,shared){
   if(_kv[key]!==undefined) return {key,value:_kv[key]};
+  // Fallback localStorage pour clés critiques
+  try{
+    const ls=localStorage.getItem('_frise_kv_'+key);
+    if(ls){ _kv[key]=ls; return {key,value:ls}; }
+  }catch(e){}
+  // Ably history paginée
   if(_ablyReady){
     try{
-      const page=await _ablyChannel('frise:kv').history({limit:200,direction:'backwards'});
-      for(const msg of (page?.items||[])){
-        if(msg.name==='set'&&msg.data?.key===key){ _kv[key]=msg.data.value; return {key,value:msg.data.value}; }
-      }
+      let page=await _ablyChannel('frise:kv').history({limit:1000,direction:'backwards'});
+      do{
+        for(const msg of (page?.items||[])){
+          if(msg.name==='set'&&msg.data?.key===key){ _kv[key]=msg.data.value; return {key,value:msg.data.value}; }
+        }
+        if(page?.hasNext()) page=await page.next(); else break;
+      }while(page);
     }catch(e){}
   }
   return null;
 }
 async function storageList(prefix,shared){
-  const keys=Object.keys(_kv).filter(k=>k.startsWith(prefix));
-  if(!keys.length&&_ablyReady){
+  if(_ablyReady){
     try{
-      const page=await _ablyChannel('frise:kv').history({limit:200,direction:'backwards'});
-      for(const msg of (page?.items||[])){
-        if(msg.name==='set'&&msg.data?.key&&_kv[msg.data.key]===undefined) _kv[msg.data.key]=msg.data.value;
-      }
+      let page=await _ablyChannel('frise:kv').history({limit:1000,direction:'backwards'});
+      const seen=new Set();
+      do{
+        for(const msg of (page?.items||[])){
+          if(msg.name==='set'&&msg.data?.key&&!seen.has(msg.data.key)){
+            seen.add(msg.data.key);
+            _kv[msg.data.key]=msg.data.value;
+          }
+        }
+        if(page?.hasNext()) page=await page.next(); else break;
+      }while(page);
     }catch(e){}
-    return {keys:Object.keys(_kv).filter(k=>k.startsWith(prefix))};
   }
-  return {keys};
+  return {keys:Object.keys(_kv).filter(k=>k.startsWith(prefix))};
 }
 
 // ── Heartbeat ───────────────────────────────────────────────────
@@ -4142,7 +4170,7 @@ async function _runPoll(){
   _pollRunning=true;
   try{
     if(_currentUser&&_ablyReady) await sbPushMyStats();
-    await chatPoll(false);
+    // chatPoll supprimé — chat géré par frise:chat subscribe
   }catch(e){}finally{ _pollRunning=false; }
 }
 
@@ -4323,13 +4351,18 @@ function _showLoginError(msg){
 
 async function sbLogout(){
   if(_currentUser){
-    // Retirer physiquement du scoreboard
+    await _presenceLeave(); // quitte présence Ably immédiatement
+    // Retirer de l'index KV → disparaît du scoreboard pour tout le monde
     try{
-      const prev=await storageGet(_currentUser.key,true);
-      if(prev){ const d=JSON.parse(prev.value); d.online=false; d.lastSeen=Date.now(); await storageSet(_currentUser.key,JSON.stringify(d),true); }
+      const idxRaw=await storageGet('frise_users:index',true);
+      if(idxRaw){
+        const idx=JSON.parse(idxRaw.value);
+        idx.keys=idx.keys.filter(k=>k!==_currentUser.key);
+        await storageSet('frise_users:index',JSON.stringify(idx),true);
+      }
     }catch(e){}
+    // Retirer du cache local immédiatement
     _usersCache=_usersCache.filter(u=>u.name!==_currentUser.name);
-    await _presenceLeave();
   }
   sbStopHeartbeat();
   chatStopPoll();
@@ -4384,13 +4417,29 @@ async function sbLoginFromModal(){
 
 async function initUser(){
   await ablyInit();
+  // Bootstrap 1 : localStorage (instantané, nos propres données)
+  try{
+    for(let i=0;i<localStorage.length;i++){
+      const k=localStorage.key(i);
+      if(k&&k.startsWith('_frise_kv_')){ const rk=k.slice(10); if(_kv[rk]===undefined) _kv[rk]=localStorage.getItem(k); }
+    }
+  }catch(e){}
+  // Bootstrap 2 : Ably history paginée (données de tous les users)
   if(_ablyReady){
     try{
-      const page=await _ablyChannel('frise:kv').history({limit:200,direction:'backwards'});
-      for(const msg of (page?.items||[])){
-        if(msg.name==='set'&&msg.data?.key&&_kv[msg.data.key]===undefined) _kv[msg.data.key]=msg.data.value;
-      }
-    }catch(e){}
+      let page=await _ablyChannel('frise:kv').history({limit:1000,direction:'backwards'});
+      const seen=new Set(Object.keys(_kv));
+      do{
+        for(const msg of (page?.items||[])){
+          if(msg.name==='set'&&msg.data?.key&&!seen.has(msg.data.key)){
+            seen.add(msg.data.key);
+            _kv[msg.data.key]=msg.data.value;
+          }
+        }
+        if(page?.hasNext()) page=await page.next(); else break;
+      }while(page);
+    }catch(e){ console.warn('[initUser] bootstrap error:',e); }
+    updateOnlineCount();
   }
   const saved=localStorage.getItem('prepa_username');
   const savedPw=localStorage.getItem('prepa_pwhash')||'';
@@ -4402,7 +4451,6 @@ async function initUser(){
       updateSbUI(); chatRenderFooter();
     }
   }
-  if(_ablyReady){ updateOnlineCount(); chatPoll(false); }
 }
 
 // ── Toast helper ────────────────────────────────────────────────
@@ -6088,10 +6136,10 @@ function buildRelationsHtml(ref){
 // ═══════════════════════════════════════════════════════
 //  SYSTÈME CHAT
 // ═══════════════════════════════════════════════════════
-const CHAT_KEY      = 'frise_chat:messages';
-const CHAT_TTL      = 5 * 60 * 60 * 1000; // 5 heures
-const CHAT_POLL_MS  = 15000; // refresh toutes les 15s — réduit la charge réseau
-const CHAT_MAX      = 120;   // max messages gardés
+const CHAT_KEY      = 'frise_chat:messages'; // gardé pour compat
+const CHAT_TTL      = 5 * 60 * 60 * 1000; // 5 heures (72h via Ably history)
+const CHAT_MAX      = 200;
+let _chatHistoryLoaded = false;
 
 // ── Filtre de modération ───────────────────────────────
 const CHAT_BAD_WORDS = [
@@ -6128,11 +6176,8 @@ function chatOpen(){
   document.getElementById('chat-toggle-btn')?.classList.remove('has-unread');
   _chatMarkRead();
   chatRenderFooter();
-  // Afficher le cache immédiatement sans attendre le réseau
   if(_chatMsgs.length) chatRenderMessages();
-  // Fetch silencieux en arrière-plan
-  chatPoll(false);
-  if(!_chatPollTimer) chatStartPoll();
+  if(!_chatHistoryLoaded) _loadChatHistory();
 }
 function chatClose(){
   _chatOpen = false;
@@ -6157,40 +6202,34 @@ function _chatRefreshBadge(){
   }
 }
 
-async function chatPoll(force=false){
-  if(!_ablyReady) return;
+// Charger l'historique chat depuis Ably (72h)
+async function _loadChatHistory(){
+  if(!_ablyReady||_chatHistoryLoaded) return;
   try{
-    const raw = await storageGet(CHAT_KEY, true);
-    const msgs = raw ? JSON.parse(raw.value) : [];
-    const now  = Date.now();
-    const fresh = msgs.filter(m => (now - m.ts) < CHAT_TTL);
-    const changed = fresh.length !== _chatMsgs.length ||
-      (fresh.length > 0 && _chatMsgs.length > 0 &&
-       fresh[fresh.length-1].ts !== _chatMsgs[_chatMsgs.length-1].ts);
-    _chatMsgs = fresh;
-    if(changed || force){
-      if(_chatOpen){
-        chatRenderMessages();
-        _chatMarkRead();
-      } else {
-        // Ne compter que les messages des AUTRES (pas les siens)
-        const me = _currentUser?.name;
-        const newCount = fresh.filter(m => m.ts > _chatLastSeen && m.author !== me).length;
-        if(newCount > _chatUnread){
-          _chatUnread = newCount;
-          _chatRefreshBadge();
-        }
-      }
-    }
-    // SOURCE UNIQUE : Ably Presence (updateOnlineCount gère déjà la pill)
-    updateOnlineCount();
-  }catch(e){}
+    const ch=_ablyChannel('frise:chat');
+    const page=await ch.history({limit:CHAT_MAX,direction:'backwards'});
+    const items=(page?.items||[]).reverse();
+    const now=Date.now();
+    items.forEach(msg=>{
+      const m=msg.data;
+      if(!m||!m.ts||!m.author) return;
+      if((now-m.ts)>=CHAT_TTL) return;
+      const exists=_chatMsgs.some(x=>x.ts===m.ts&&x.author===m.author);
+      if(!exists) _chatMsgs.push(m);
+    });
+    _chatMsgs.sort((a,b)=>a.ts-b.ts);
+    _chatMsgs=_chatMsgs.slice(-CHAT_MAX);
+    _chatHistoryLoaded=true;
+    if(_chatOpen){ chatRenderMessages(); _chatMarkRead(); }
+    const me=_currentUser?.name;
+    const unread=_chatMsgs.filter(m=>m.ts>_chatLastSeen&&m.author!==me).length;
+    if(unread>0){ _chatUnread=unread; _chatRefreshBadge(); }
+  }catch(e){ console.warn('[Chat] history error:',e); }
 }
 
-function chatStartPoll(){
-  if(_chatPollTimer) clearInterval(_chatPollTimer);
-  _chatPollTimer = setInterval(()=>chatPoll(), CHAT_POLL_MS);
-}
+// chatPoll et chatStartPoll sont devenus no-op — chat via pub/sub Ably
+async function chatPoll(force=false){ /* no-op — chat géré par frise:chat subscribe */ }
+function chatStartPoll(){ /* no-op */ }
 function chatStopPoll(){
   if(_chatPollTimer){ clearInterval(_chatPollTimer); _chatPollTimer=null; }
 }
@@ -6258,7 +6297,7 @@ function chatRenderFooter(){
         oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,80)+'px'"></textarea>
       <button class="chat-send" id="chat-send-btn" onclick="chatSend()" title="Envoyer">➤</button>
     </div>
-    <div style="font-family:'DM Mono',monospace;font-size:8px;color:var(--t5);margin-top:5px;text-align:center">Messages supprimés après 5h · Respect requis</div>`;
+    <div style="font-family:'DM Mono',monospace;font-size:8px;color:var(--t5);margin-top:5px;text-align:center">Messages conservés 72h · Respect requis</div>`;
 }
 
 async function chatSend(){
@@ -6273,30 +6312,19 @@ async function chatSend(){
   input.value = '';
   input.style.height = 'auto';
   try{
-    const msg = {
-      ts: Date.now(),
-      author: _currentUser.name,
-      color: _currentUser.color,
-      text
-    };
-    // Lire, purger TTL, ajouter, sauver
-    const raw2 = await storageGet(CHAT_KEY, true);
-    const msgs = raw2 ? JSON.parse(raw2.value) : [];
-    const now  = Date.now();
-    const fresh = msgs.filter(m => (now - m.ts) < CHAT_TTL);
-    fresh.push(msg);
-    // Garder les CHAT_MAX derniers
-    const toSave = fresh.slice(-CHAT_MAX);
-    await storageSet(CHAT_KEY, JSON.stringify(toSave), true);
-    _chatMsgs = toSave;
-    _chatLastSeen = msg.ts;
-    chatRenderMessages();
-  }catch(e){
-    console.warn('Chat send error:', e);
-  } finally {
-    if(btn) btn.disabled = false;
-    input.focus();
-  }
+    const msg={ts:Date.now(),author:_currentUser.name,color:_currentUser.color,text};
+    // Publier via Ably pub/sub — reçu instantanément par tous via subscribe
+    await _ablyChannel('frise:chat').publish('msg',msg);
+    // Ajouter localement immédiatement
+    const exists=_chatMsgs.some(x=>x.ts===msg.ts&&x.author===msg.author);
+    if(!exists){
+      _chatMsgs.push(msg);
+      _chatMsgs=_chatMsgs.slice(-CHAT_MAX);
+      _chatLastSeen=msg.ts;
+      chatRenderMessages();
+    }
+  }catch(e){ console.warn('[Chat] send error:',e); }
+  finally{ if(btn) btn.disabled=false; input.focus(); }
 }
 
 loadMastery();
