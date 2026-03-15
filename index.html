@@ -4570,29 +4570,60 @@ async function _subscribeRealtimeChannels(){
   });
 }
 
+function _refreshOnlineConnectionUi(){
+  try{ updateSbUI(); }catch(e){}
+  try{ chatRenderFooter(); }catch(e){}
+  try{ updateOnlineCount(); }catch(e){}
+  if(_currentView==='scoreboard' && typeof go==='function'){
+    try{ go('scoreboard'); }catch(e){}
+  }
+}
 async function ablyInit(){
   if(_ablyInitPromise) return _ablyInitPromise;
   _ablyInitPromise = new Promise(resolve=>{
     const boot = ()=>_setupAbly(resolve);
     if(typeof Ably!=='undefined'){ boot(); return; }
-    const existing = document.querySelector(`script[${ABLY_LOADER_ATTR}="1"]`);
-    if(existing){
-      existing.addEventListener('load', boot, {once:true});
-      existing.addEventListener('error', ()=>resolve(), {once:true});
-      return;
-    }
-    const s=document.createElement('script');
-    s.src='https://cdn.ably.com/lib/ably.min-2.js';
-    s.setAttribute(ABLY_LOADER_ATTR, '1');
-    s.onload=boot;
-    s.onerror=()=>{ console.warn('[Ably] load failed'); resolve(); };
-    document.head.appendChild(s);
+
+    const sources = [
+      'https://cdn.ably.com/lib/ably.min-2.js',
+      'https://unpkg.com/ably@2/build/ably.min.js',
+      'https://cdn.jsdelivr.net/npm/ably@2/build/ably.min.js'
+    ];
+
+    const loadFrom = (index)=>{
+      if(typeof Ably!=='undefined'){ boot(); return; }
+      if(index >= sources.length){ console.warn('[Ably] all loaders failed'); resolve(); return; }
+      const s=document.createElement('script');
+      s.src=sources[index];
+      s.async=true;
+      s.crossOrigin='anonymous';
+      s.setAttribute(ABLY_LOADER_ATTR, String(index + 1));
+      s.onload=()=>{
+        if(typeof Ably!=='undefined') boot();
+        else loadFrom(index + 1);
+      };
+      s.onerror=()=>{
+        console.warn('[Ably] load failed:', sources[index]);
+        s.remove();
+        loadFrom(index + 1);
+      };
+      document.head.appendChild(s);
+    };
+
+    loadFrom(0);
   });
   return _ablyInitPromise;
 }
 function _setupAbly(resolve){
   try{
-    if(_ably){ resolve(); return; }
+    if(_ably){
+      if(_ably.connection?.state === 'connected'){
+        _ablyReady = true;
+        _refreshOnlineConnectionUi();
+      }
+      resolve();
+      return;
+    }
     _ably = new Ably.Realtime({
       key: ABLY_KEY,
       clientId: `${ONLINE_SCOPE.clientPrefix}-anon-${Math.random().toString(36).slice(2,8)}`,
@@ -4601,26 +4632,59 @@ function _setupAbly(resolve){
     });
 
     let resolved = false;
+    let bootstrapping = false;
     const done = ()=>{ if(!resolved){ resolved = true; resolve(); } };
-    const fallback = setTimeout(done, 8000);
+    const fallback = setTimeout(done, 12000);
 
-    _ably.connection.on('connected', async ()=>{
+    const handleConnected = async ()=>{
       _ablyReady = true;
-      clearTimeout(fallback);
-      await _subscribeRealtimeChannels();
-      await _bootstrapKvFromHistory(true);
-      await __syncPresenceMembers();
-      await __loadProfilesFromHistory(true);
-      if(_currentUser){
-        await _syncPresenceFromVisibility(true);
-        await sbPushMyStats();
+      _refreshOnlineConnectionUi();
+      if(bootstrapping) return;
+      bootstrapping = true;
+      try{
+        await _subscribeRealtimeChannels();
+        await _bootstrapKvFromHistory(true);
+        await __syncPresenceMembers();
+        await __loadProfilesFromHistory(true);
+        if(_currentUser){
+          await _syncPresenceFromVisibility(true);
+          await sbPushMyStats();
+        }
+        if(_currentView==='scoreboard') await _fetchAllUsers(true);
+      }catch(e){
+        console.warn('[Ably] post-connect error:', e);
+      }finally{
+        bootstrapping = false;
+        clearTimeout(fallback);
+        _refreshOnlineConnectionUi();
+        done();
       }
-      if(_currentView==='scoreboard') _fetchAllUsers(true);
-      done();
-    });
-    _ably.connection.on('disconnected', ()=>{ _ablyReady = false; _presenceJoined=false; });
-    _ably.connection.on('suspended', ()=>{ _ablyReady = false; _presenceJoined=false; });
-    _ably.connection.on('failed', ()=>{ _ablyReady = false; _presenceJoined=false; console.warn('[Ably] connection failed'); clearTimeout(fallback); done(); });
+    };
+
+    const handleUnavailable = (label, err)=>{
+      _ablyReady = false;
+      _presenceJoined = false;
+      if(label === 'failed') console.warn('[Ably] connection failed', err || '');
+      _refreshOnlineConnectionUi();
+      if(label === 'failed'){
+        clearTimeout(fallback);
+        done();
+      }
+    };
+
+    _ably.connection.on('connected', handleConnected);
+    _ably.connection.on('disconnected', ()=>handleUnavailable('disconnected'));
+    _ably.connection.on('suspended', ()=>handleUnavailable('suspended'));
+    _ably.connection.on('failed', err=>handleUnavailable('failed', err));
+
+    const state = _ably.connection.state;
+    if(state === 'connected'){
+      Promise.resolve().then(handleConnected);
+    }else if(state === 'failed'){
+      handleUnavailable('failed');
+    }else if(['initialized','disconnected','suspended','closed'].includes(state)){
+      try{ _ably.connect(); }catch(e){ console.warn('[Ably] connect() error:', e); }
+    }
   }catch(e){ console.warn('[Ably] setup error:', e); resolve(); }
 }
 
