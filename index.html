@@ -4647,54 +4647,76 @@ function _refreshOnlineConnectionUi(){
 }
 async function ablyInit(){
   if(_ablyInitPromise) return _ablyInitPromise;
+  _ablyConnectionState = _ably ? (_ably.connection?.state || 'initializing') : 'loading_library';
+  _ablyConnectionReason = '';
+  _refreshOnlineConnectionUi();
   _ablyInitPromise = new Promise(resolve=>{
     const boot = ()=>_setupAbly(resolve);
-    if(typeof Ably!=='undefined' && typeof Ably.Realtime!=='undefined'){ boot(); return; }
-
-    const existing = document.querySelector(`script[${ABLY_LOADER_ATTR}]`);
-    if(existing){
-      existing.addEventListener('load', ()=>{
-        if(typeof Ably!=='undefined' && typeof Ably.Realtime!=='undefined') boot();
-        else resolve();
-      }, {once:true});
-      existing.addEventListener('error', ()=>resolve(), {once:true});
-      return;
-    }
+    const hasAbly = ()=> (typeof Ably!=='undefined' && typeof Ably.Realtime!=='undefined');
+    if(hasAbly()){ boot(); return; }
 
     const sources = [
       'https://cdn.ably.com/lib/ably.min-2.js',
+      'https://cdn.ably.com/lib/ably.min.js',
       'https://cdn.jsdelivr.net/npm/ably@2/build/ably.min.js',
       'https://unpkg.com/ably@2/build/ably.min.js'
     ];
 
     const loadFrom = (index)=>{
-      if(typeof Ably!=='undefined' && typeof Ably.Realtime!=='undefined'){ boot(); return; }
+      if(hasAbly()){ boot(); return; }
       if(index >= sources.length){
         _ablyConnectionState = 'loader_failed';
         _ablyConnectionReason = 'Impossible de charger la librairie Ably';
+        _refreshOnlineConnectionUi();
         console.warn('[Ably] all loaders failed');
         resolve();
         return;
       }
+      _ablyConnectionState = 'loading_library';
+      _refreshOnlineConnectionUi();
       const s=document.createElement('script');
       s.src=sources[index];
       s.async=true;
       s.crossOrigin='anonymous';
       s.setAttribute(ABLY_LOADER_ATTR, String(index + 1));
       s.onload=()=>{
-        if(typeof Ably!=='undefined' && typeof Ably.Realtime!=='undefined') boot();
+        if(hasAbly()) boot();
         else {
-          s.remove();
+          try{ s.remove(); }catch(e){}
           loadFrom(index + 1);
         }
       };
       s.onerror=()=>{
         console.warn('[Ably] load failed:', sources[index]);
-        s.remove();
+        try{ s.remove(); }catch(e){}
         loadFrom(index + 1);
       };
       document.head.appendChild(s);
     };
+
+    const existing = document.querySelector(`script[${ABLY_LOADER_ATTR}]`);
+    if(existing){
+      let handedOff = false;
+      const reuseOrReload = ()=>{
+        if(handedOff) return;
+        if(hasAbly()){
+          handedOff = true;
+          boot();
+          return;
+        }
+        try{ existing.remove(); }catch(e){}
+        handedOff = true;
+        loadFrom(0);
+      };
+      existing.addEventListener('load', reuseOrReload, {once:true});
+      existing.addEventListener('error', ()=>{
+        try{ existing.remove(); }catch(e){}
+        handedOff = true;
+        loadFrom(0);
+      }, {once:true});
+      setTimeout(reuseOrReload, 1200);
+      return;
+    }
 
     loadFrom(0);
   });
@@ -4711,14 +4733,16 @@ function _setupAbly(resolve){
       return;
     }
 
-    _ablyConnectionState = 'initializing';
+    _ablyConnectionState = 'connecting';
+    _refreshOnlineConnectionUi();
     _ablyConnectionReason = '';
     _ably = new Ably.Realtime({
       key: ABLY_KEY,
       clientId: `${ONLINE_SCOPE.clientPrefix}-anon-${Math.random().toString(36).slice(2,8)}`,
       closeOnUnload: true,
       echoMessages: false,
-      tls: true
+      tls: true,
+      autoConnect: true
     });
 
     let resolved = false;
@@ -5116,24 +5140,28 @@ async function sbLoginFromModal(){
 }
 
 async function initUser(){
-  if(_onlineReinitDone) return;
+  if(_onlineReinitDone && (_ably || _ablyInitPromise)) return;
   _onlineReinitDone = true;
+  _ablyConnectionState = _ablyConnectionState === 'idle' ? 'booting' : _ablyConnectionState;
   try{ if(_onlineHeartbeat){ clearTimeout(_onlineHeartbeat); _onlineHeartbeat = null; } }catch(e){}
   _profilesHydrated = false;
   _usersCache = [];
   _usersCacheTs = 0;
   _presenceMembers = {};
-  __loadLocalProfiles().forEach(profile => __mergeProfile(profile, {persist:false}));
-  updateSbUI();
-  chatRenderFooter();
-  await ablyInit();
-  await _fetchAllUsers(true);
-  const saved=localStorage.getItem(LOGIN_USER_STORAGE_KEY);
-  const savedPw=localStorage.getItem(LOGIN_PW_STORAGE_KEY)||'';
+  try{ __loadLocalProfiles().forEach(profile => __mergeProfile(profile, {persist:false})); }catch(e){ console.warn('[online] local profile bootstrap error:', e); }
+  try{ updateSbUI(); }catch(e){ console.warn('[online] updateSbUI bootstrap error:', e); }
+  try{ chatRenderFooter(); }catch(e){ console.warn('[online] chatRenderFooter bootstrap error:', e); }
+  try{ await ablyInit(); }catch(e){ console.warn('[online] ablyInit bootstrap error:', e); }
+  try{ await _fetchAllUsers(true); }catch(e){ console.warn('[online] fetch users bootstrap error:', e); }
+  let saved = null, savedPw = '';
+  try{
+    saved = localStorage.getItem(LOGIN_USER_STORAGE_KEY);
+    savedPw = localStorage.getItem(LOGIN_PW_STORAGE_KEY)||'';
+  }catch(e){}
   if(saved){
-    await sbLogin(saved, savedPw ? '__hash__'+savedPw : '');
+    try{ await sbLogin(saved, savedPw ? '__hash__'+savedPw : ''); }catch(e){ console.warn('[online] saved login bootstrap error:', e); }
   }else{
-    updateOnlineCount();
+    try{ updateOnlineCount(); }catch(e){}
   }
 }
 
@@ -7055,6 +7083,23 @@ recordAnswer = function(ref, ok){
   clearTimeout(recordAnswer._pushTimer);
   recordAnswer._pushTimer = setTimeout(()=>{ if(_currentUser) sbPushMyStats(); }, 8000);
 };
+</script>
+<script>
+(function(){
+  const ensureBoot = function(){
+    try{
+      if(typeof initUser === 'function' && (!window.__eshOnlineBootAttempted || !window.__eshOnlineBootAttempted.done)){
+        window.__eshOnlineBootAttempted = {done:true, ts:Date.now()};
+        initUser();
+      }else if(typeof sbReconnectNow === 'function' && typeof _ably !== 'undefined' && !_ably){
+        sbReconnectNow();
+      }
+    }catch(e){ console.warn('[esh-online] secondary bootstrap error:', e); }
+  };
+  if(document.readyState === 'complete') ensureBoot();
+  else window.addEventListener('load', ensureBoot, {once:true});
+  setTimeout(ensureBoot, 900);
+})();
 </script>
 </body>
 </html>
