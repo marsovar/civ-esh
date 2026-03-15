@@ -3907,6 +3907,7 @@ let _kv = {};
 let _presenceMembers = {}; // name -> {name, color, ts}
 let _usersCache = [], _usersCacheTs = 0;
 let _sbPushInProgress = false, _sbUserIndexed = false;
+let _presenceDesired = false, _presenceJoined = false;
 
 const ONLINE_TTL = 15000;
 const POLL_INTERVAL_ACTIVE = 6000;
@@ -3919,10 +3920,22 @@ const USER_COLORS = ['#2a7a8f','#2d7a5f','#c0392b','#6b4fa8','#b8922a','#1a6a9a'
 const ABLY_KEY = 'omrAsg.61E1oQ:sJXWtnTzOlCdLP2t44fhmBB1RyMPURSJQJLNOPwccR8';
 
 // Tab focus
-let _tabFocused = !document.hidden;
-document.addEventListener('visibilitychange', ()=>{ _tabFocused = !document.hidden; });
-window.addEventListener('focus', ()=>{ _tabFocused = true; });
+let _tabFocused = !document.hidden && document.hasFocus();
+document.addEventListener('visibilitychange', ()=>{ _tabFocused = !document.hidden && document.hasFocus(); });
+window.addEventListener('focus', ()=>{ _tabFocused = !document.hidden; });
 window.addEventListener('blur', ()=>{ _tabFocused = false; });
+
+function _shouldBePresent(){
+  return !!(_ablyReady && _currentUser && !document.hidden && _tabFocused);
+}
+
+async function _syncPresence(force=false){
+  const should = _shouldBePresent();
+  if(!force && should===_presenceDesired) return;
+  _presenceDesired = should;
+  if(should) await _presenceEnter();
+  else await _presenceLeave();
+}
 
 function sbUserKey(name){ return 'frise_users:'+name.toLowerCase().replace(/[^a-z0-9]/g,'_'); }
 function isOnline(u){ return u && isUserOnline(u.name); } // basé sur Ably Presence
@@ -4045,7 +4058,7 @@ function _setupAbly(resolve){
     });
     _ably.connection.on('failed',()=>{ console.warn('Ably failed'); resolve(); });
     _ably.connection.on('disconnected',()=>{ _ablyReady=false; });
-    _ably.connection.on('connected',()=>{ _ablyReady=true; });
+    _ably.connection.on('connected',()=>{ _ablyReady=true; _syncPresence(true); });
   }catch(e){ console.warn('Ably setup error:',e); resolve(); }
 }
 
@@ -4054,13 +4067,21 @@ async function _presenceEnter(){
   try{
     const ch=_ablyChannel('frise:presence');
     const data={name:_currentUser.name,color:_currentUser.color,ts:Date.now()};
-    try{ await ch.presence.enter(data); }
-    catch(e){ try{ await ch.presence.update(data); }catch(e2){} }
+    if(_presenceJoined){
+      try{ await ch.presence.update(data); }catch(e){}
+      return;
+    }
+    try{ await ch.presence.enter(data); _presenceJoined=true; }
+    catch(e){
+      try{ await ch.presence.update(data); _presenceJoined=true; }catch(e2){}
+    }
   }catch(e){}
 }
 async function _presenceLeave(){
-  if(!_ablyReady) return;
+  if(!_ablyReady){ _presenceJoined=false; return; }
+  if(!_presenceJoined && !_currentUser) return;
   try{ await _ablyChannel('frise:presence').presence.leave(); }catch(e){}
+  _presenceJoined=false;
   if(_currentUser) delete _presenceMembers[_currentUser.name];
   updateOnlineCount();
 }
@@ -4076,10 +4097,17 @@ function _onPresenceEvent(member){
 function _onAblyUserUpdate(value){
   try{
     const u=JSON.parse(value);
+    const isActive = u && u.scoreboardActive !== false;
     const idx=_usersCache.findIndex(x=>x.name===u.name);
-    if(idx>=0) _usersCache[idx]=u; else _usersCache.push(u);
+    if(isActive){
+      if(idx>=0) _usersCache[idx]=u; else _usersCache.push(u);
+    } else if(idx>=0){
+      _usersCache.splice(idx,1);
+    }
     _usersCache.sort((a,b)=>(b.scores?.total||0)-(a.scores?.total||0));
     _usersCacheTs=Date.now();
+    const sbContent=document.getElementById('sb-content');
+    if(sbContent && _currentView==='scoreboard') sbRenderList(sbContent,_usersCache);
   }catch(e){}
 }
 
@@ -4146,20 +4174,30 @@ function _getAdaptiveInterval(){
 function sbStartHeartbeat(){
   if(_onlineHeartbeat) clearTimeout(_onlineHeartbeat);
   _runPoll();
+  _syncPresence(true);
   function _schedule(){
     _onlineHeartbeat=setTimeout(async()=>{ await _runPoll(); _schedule(); }, _getAdaptiveInterval());
   }
   _schedule();
-  // beforeunload : quitter la présence Ably mais NE PAS marquer offline dans KV
-  window.addEventListener('beforeunload',()=>{ _presenceLeave(); });
-  document.addEventListener('visibilitychange',()=>{
-    _tabFocused=!document.hidden;
-    if(!document.hidden){ _usersCacheTs=0; if(_onlineHeartbeat) clearTimeout(_onlineHeartbeat); _runPoll().then(()=>_schedule()); }
-    else sbPushMyStats();
-  });
-  window.addEventListener('focus',()=>{ _tabFocused=true; sbPushMyStats(); });
-  window.addEventListener('blur', ()=>{ _tabFocused=false; sbPushMyStats(); });
 }
+
+function _handlePresenceVisibilityChange(){
+  _tabFocused=!document.hidden && document.hasFocus();
+  if(!document.hidden){
+    _usersCacheTs=0;
+    if(_onlineHeartbeat){ clearTimeout(_onlineHeartbeat); _onlineHeartbeat=null; }
+    _runPoll().then(()=>{ if(_currentUser && !_onlineHeartbeat){ const again=()=>{ _onlineHeartbeat=setTimeout(async()=>{ await _runPoll(); again(); }, _getAdaptiveInterval()); }; again(); } });
+  } else {
+    sbPushMyStats();
+  }
+  _syncPresence();
+}
+
+window.addEventListener('beforeunload',()=>{ _presenceDesired=false; _presenceLeave(); });
+window.addEventListener('pagehide',()=>{ _presenceDesired=false; _presenceLeave(); });
+document.addEventListener('visibilitychange',_handlePresenceVisibilityChange);
+window.addEventListener('focus',()=>{ _tabFocused=!document.hidden; sbPushMyStats(); _syncPresence(); });
+window.addEventListener('blur', ()=>{ _tabFocused=false; sbPushMyStats(); _syncPresence(); });
 function sbStopHeartbeat(){
   if(_onlineHeartbeat){ clearTimeout(_onlineHeartbeat); _onlineHeartbeat=null; }
 }
@@ -4186,10 +4224,16 @@ async function _fetchAllUsers(force=false){
     if(!idx.keys?.length) return _usersCache;
     const raws=await Promise.all(idx.keys.map(k=>storageGet(k,true).catch(()=>null)));
     const users=[];
-    raws.forEach(raw=>{ if(raw) try{ users.push(JSON.parse(raw.value)); }catch(e){} });
-    // TOUS les users restent dans le scoreboard — seul sbLogout retire
+    raws.forEach(raw=>{
+      if(raw) try{
+        const u=JSON.parse(raw.value);
+        if(u && u.scoreboardActive !== false) users.push(u);
+      }catch(e){}
+    });
     _usersCache=users.sort((a,b)=>(b.scores?.total||0)-(a.scores?.total||0));
     _usersCacheTs=now;
+    const sbContent=document.getElementById('sb-content');
+    if(sbContent && _currentView==='scoreboard') sbRenderList(sbContent,_usersCache);
   }catch(e){}
   return _usersCache;
 }
@@ -4208,7 +4252,7 @@ async function sbPushMyStats(extra={}){
     const userData=Object.assign({},prevData,{
       name:_currentUser.name, color:_currentUser.color,
       pwHash:_currentUser.pwHash||prevData.pwHash||'',
-      lastSeen:Date.now(), online:true,
+      lastSeen:Date.now(), online:_shouldBePresent(), scoreboardActive:true,
       scores, streak:getStreak(),
       bestStreak:Math.max(_getStoredBestStreak(),prevData.bestStreak||0),
       duelsWon:Math.max(prevData.duelsWon||0,extra.duelsWon||0),
@@ -4230,7 +4274,10 @@ async function sbSetOffline(){
   try{
     const prev=await storageGet(_currentUser.key,true);
     if(!prev) return;
-    const d=JSON.parse(prev.value); d.online=false; d.lastSeen=Date.now();
+    const d=JSON.parse(prev.value);
+    d.online=false;
+    d.lastSeen=Date.now();
+    d.scoreboardActive = d.scoreboardActive !== false;
     await storageSet(_currentUser.key,JSON.stringify(d),true);
   }catch(e){}
 }
@@ -4335,12 +4382,13 @@ async function sbLogin(name, password=''){
   if(pwHash) localStorage.setItem('prepa_pwhash',pwHash);
 
   _sbUserIndexed=false;
+  _presenceDesired=false;
+  _presenceJoined=false;
   sbStartHeartbeat();
   updateSbUI();
   chatRenderFooter();
   document.getElementById('sb-login-modal')?.remove();
-  // Connexion instantanée : push + présence en parallèle
-  Promise.all([sbPushMyStats(), _presenceEnter()]).catch(()=>{});
+  Promise.all([sbPushMyStats({scoreboardActive:true}), _syncPresence(true)]).catch(()=>{});
   return true;
 }
 
@@ -4350,23 +4398,28 @@ function _showLoginError(msg){
 }
 
 async function sbLogout(){
-  if(_currentUser){
-    await _presenceLeave(); // quitte présence Ably immédiatement
-    // Retirer de l'index KV → disparaît du scoreboard pour tout le monde
+  const leavingUser=_currentUser;
+  if(leavingUser){
+    _presenceDesired=false;
+    await _presenceLeave();
     try{
-      const idxRaw=await storageGet('frise_users:index',true);
-      if(idxRaw){
-        const idx=JSON.parse(idxRaw.value);
-        idx.keys=idx.keys.filter(k=>k!==_currentUser.key);
-        await storageSet('frise_users:index',JSON.stringify(idx),true);
-      }
+      const prev=await storageGet(leavingUser.key,true);
+      const prevData=prev?JSON.parse(prev.value):{};
+      const nextData=Object.assign({},prevData,{
+        name:leavingUser.name,
+        color:leavingUser.color,
+        pwHash:leavingUser.pwHash||prevData.pwHash||'',
+        online:false,
+        lastSeen:Date.now(),
+        scoreboardActive:false
+      });
+      await storageSet(leavingUser.key,JSON.stringify(nextData),true);
     }catch(e){}
-    // Retirer du cache local immédiatement
-    _usersCache=_usersCache.filter(u=>u.name!==_currentUser.name);
+    _usersCache=_usersCache.filter(u=>u.name!==leavingUser.name);
   }
   sbStopHeartbeat();
   chatStopPoll();
-  _currentUser=null; _duelState=null; _sbUserIndexed=false;
+  _currentUser=null; _duelState=null; _sbUserIndexed=false; _presenceDesired=false; _presenceJoined=false;
   localStorage.removeItem('prepa_username');
   localStorage.removeItem('prepa_pwhash');
   updateSbUI(); chatRenderFooter();
