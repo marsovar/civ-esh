@@ -4907,13 +4907,13 @@ function sbRenderList(container, users){
     return;
   }
   const medals=['🥇','🥈','🥉'];
-  // Présence Ably — noms en ligne
-  const presenceKeys=_getPresenceUserKeys();
+  // Présence Ably — noms en ligne (clés par nom, compatibles avec _presenceMembers)
+  const presenceKeys=new Set(Object.keys(_presenceMembers));
   let html='<div style="display:flex;flex-direction:column;gap:5px">';
   users.forEach((u,i)=>{
     const isMe=_currentUser&&u.name===_currentUser.name;
     u.key = u.key || sbUserKey(u.name);
-    const online=presenceKeys.has(u.key) || (isMe && !!_currentUser && _ablyReady);
+    const online=presenceKeys.has(u.name) || (isMe && !!_currentUser && _ablyReady);
     const score=u.scores?.total||0;
     const medal=medals[i]||`<span style="font-family:'DM Mono',monospace;color:var(--t4);font-size:10px">#${i+1}</span>`;
     const bg=isMe?`rgba(${hexToRgb(u.color)},0.08)`:'var(--s1)';
