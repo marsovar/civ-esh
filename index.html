@@ -3889,12 +3889,13 @@ function loadQuizConfig(){
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  ONLINE — SYSTÈME EN LIGNE v32 (Ably reconstruit)
-//  Namespace Ably dédié à ce site pour éviter tout conflit avec d'autres projets.
-//  • Scoreboard persistant (hors ligne visible tant que pas de déconnexion)
-//  • Présence temps réel séparée du stockage des comptes
-//  • Duels proposés uniquement aux joueurs réellement connectés
-//  • KV logique unifié avec clés physiques namespacées
+//  ONLINE — SYSTÈME EN LIGNE v40 (Ably refondu)
+//  Namespace Ably strictement dédié à ce site.
+//  • Profils persistants séparés de la présence temps réel
+//  • Scoreboard global : tout compte connecté au moins une fois reste visible
+//  • Disparition du scoreboard uniquement via la déconnexion explicite
+//  • Duels autorisés uniquement contre un joueur réellement présent
+//  • Réhydratation du cache local vers Ably pour limiter la perte d'état côté client
 // ══════════════════════════════════════════════════════════════════
 let _currentUser = null;
 let _sbExpanded = null;
@@ -3923,27 +3924,27 @@ const USER_COLORS = ['#2a7a8f','#2d7a5f','#c0392b','#6b4fa8','#b8922a','#1a6a9a'
 const ABLY_KEY = 'omrAsg.61E1oQ:sJXWtnTzOlCdLP2t44fhmBB1RyMPURSJQJLNOPwccR8';
 
 const ONLINE_SCOPE = Object.freeze({
-  app: 'esh-economie-live-v2',
-  clientPrefix: 'esheco',
-  localPrefix: '__esh_economie_live_v2__',
+  app: 'esh-scoreboard-prepa-v40',
+  clientPrefix: 'eshsb40',
+  localPrefix: '__esh_scoreboard_prepa_v40__',
   channels: {
-    kv: 'esh-economie-live-v2:state',
-    chat: 'esh-economie-live-v2:chat',
-    presence: 'esh-economie-live-v2:presence',
-    duels: 'esh-economie-live-v2:duels'
+    kv: 'esh-scoreboard-prepa-v40:kv',
+    chat: 'esh-scoreboard-prepa-v40:chat',
+    presence: 'esh-scoreboard-prepa-v40:presence',
+    duels: 'esh-scoreboard-prepa-v40:duels'
   },
   aliases: {
-    'frise:kv': 'esh-economie-live-v2:state',
-    'ecg:kv': 'esh-economie-live-v2:state',
-    'frise:chat': 'esh-economie-live-v2:chat',
-    'ecg:chat': 'esh-economie-live-v2:chat',
-    'frise:presence': 'esh-economie-live-v2:presence',
-    'ecg:presence': 'esh-economie-live-v2:presence',
-    'frise:duels': 'esh-economie-live-v2:duels',
-    'ecg:duels': 'esh-economie-live-v2:duels'
+    'frise:kv': 'esh-scoreboard-prepa-v40:kv',
+    'ecg:kv': 'esh-scoreboard-prepa-v40:kv',
+    'frise:chat': 'esh-scoreboard-prepa-v40:chat',
+    'ecg:chat': 'esh-scoreboard-prepa-v40:chat',
+    'frise:presence': 'esh-scoreboard-prepa-v40:presence',
+    'ecg:presence': 'esh-scoreboard-prepa-v40:presence',
+    'frise:duels': 'esh-scoreboard-prepa-v40:duels',
+    'ecg:duels': 'esh-scoreboard-prepa-v40:duels'
   },
   userIndexKey: 'players:index',
-  kvPrefix: 'esh-economie-live-v2:kv:'
+  kvPrefix: 'esh-scoreboard-prepa-v40:kv:'
 });
 
 // Tab focus
@@ -4004,6 +4005,62 @@ function _extractLogicalKeyFromLocalStorageKey(rawKey){
   if(rawKey.startsWith(ONLINE_SCOPE.localPrefix)) return rawKey.slice(ONLINE_SCOPE.localPrefix.length);
   if(rawKey.startsWith('_frise_kv_')) return _normalizeLogicalKey(rawKey.slice('_frise_kv_'.length));
   return null;
+}
+
+function _collectCachedLogicalEntries(){
+  const entries = [];
+  try{
+    for(let i=0;i<localStorage.length;i++){
+      const rawKey = localStorage.key(i);
+      const logical = _extractLogicalKeyFromLocalStorageKey(rawKey);
+      if(!logical) continue;
+      const value = localStorage.getItem(rawKey);
+      if(value===null) continue;
+      entries.push({ logical, value });
+    }
+  }catch(e){}
+  return entries;
+}
+
+async function _rehydrateSharedProfilesFromLocalCache(){
+  if(!_ablyReady) return;
+  try{
+    const cached = _collectCachedLogicalEntries().filter(x=>x.logical===ONLINE_SCOPE.userIndexKey || x.logical.startsWith('players:'));
+    if(!cached.length) return;
+
+    let indexRaw = await storageGet(ONLINE_SCOPE.userIndexKey, true);
+    let indexData = indexRaw ? JSON.parse(indexRaw.value||'{}') : {keys:[]};
+    if(!Array.isArray(indexData.keys)) indexData.keys = [];
+    let indexDirty = false;
+
+    for(const entry of cached){
+      if(entry.logical === ONLINE_SCOPE.userIndexKey) continue;
+      let localProfile = null;
+      try{ localProfile = JSON.parse(entry.value); }catch(e){}
+      if(!localProfile?.name) continue;
+      localProfile.key = localProfile.key || entry.logical;
+      localProfile.scoreboardActive = localProfile.scoreboardActive !== false;
+      const shared = await storageGet(entry.logical, true).catch(()=>null);
+      let shouldPublish = !shared;
+      if(shared){
+        try{
+          const remoteProfile = JSON.parse(shared.value||'{}');
+          const localTs = Math.max(localProfile.updatedAt||0, localProfile.lastSeen||0);
+          const remoteTs = Math.max(remoteProfile.updatedAt||0, remoteProfile.lastSeen||0);
+          shouldPublish = localTs > remoteTs;
+        }catch(e){
+          shouldPublish = true;
+        }
+      }
+      if(shouldPublish) await storageSet(entry.logical, JSON.stringify(localProfile), true);
+      if(!indexData.keys.includes(entry.logical)){
+        indexData.keys.push(entry.logical);
+        indexDirty = true;
+      }
+    }
+
+    if(indexDirty) await storageSet(ONLINE_SCOPE.userIndexKey, JSON.stringify(indexData), true);
+  }catch(e){ console.warn('[Online] rehydrate local cache error:', e); }
 }
 
 function _userPresenceKey(input){
@@ -4228,6 +4285,8 @@ function _setupAbly(resolve){
         _ablyReady = true;
         await _subscribeRealtimeChannels();
         await _bootstrapKvFromHistory();
+        await _rehydrateSharedProfilesFromLocalCache();
+        await _bootstrapKvFromHistory(true);
         await _refreshPresenceSnapshot();
         await _syncPresence(true);
         if(_currentView==='scoreboard') _fetchAllUsers(true);
@@ -4308,7 +4367,7 @@ function _onAblyUserUpdate(value){
     if(!u?.name) return;
     u.key = u.key || sbUserKey(u.name);
     const isActive = u.scoreboardActive !== false;
-    const idx=_usersCache.findIndex(x=>x.name===u.name);
+    const idx=_usersCache.findIndex(x=>(x.key||sbUserKey(x.name))===u.key);
     if(isActive){
       if(idx>=0) _usersCache[idx]=u; else _usersCache.push(u);
     }else if(idx>=0){
@@ -4319,7 +4378,7 @@ function _onAblyUserUpdate(value){
       if(scoreDiff) return scoreDiff;
       const duelDiff = (b.duelsWon||0)-(a.duelsWon||0);
       if(duelDiff) return duelDiff;
-      return (b.lastSeen||0)-(a.lastSeen||0);
+      return Math.max(b.updatedAt||0,b.lastSeen||0)-Math.max(a.updatedAt||0,a.lastSeen||0);
     });
     _usersCacheTs=Date.now();
     const sbContent=document.getElementById('sb-content');
@@ -4442,24 +4501,28 @@ async function _fetchAllUsers(force=false){
     if(!keys.length){
       keys = Object.keys(_kv).filter(k=>k.startsWith('players:'));
     }
-    const uniqKeys = [...new Set(keys.filter(Boolean))];
+    const cachedProfileKeys = _collectCachedLogicalEntries().map(x=>x.logical).filter(k=>k.startsWith('players:'));
+    const uniqKeys = [...new Set(keys.filter(Boolean).concat(cachedProfileKeys))];
     const raws=await Promise.all(uniqKeys.map(k=>storageGet(k,true).catch(()=>null)));
-    const users=[];
+    const usersByKey=new Map();
     raws.forEach(raw=>{
       if(raw) try{
         const u=JSON.parse(raw.value);
         if(u && u.scoreboardActive !== false){
           u.key = u.key || sbUserKey(u.name);
-          users.push(u);
+          const prev = usersByKey.get(u.key);
+          const prevTs = prev ? Math.max(prev.updatedAt||0, prev.lastSeen||0) : -1;
+          const nextTs = Math.max(u.updatedAt||0, u.lastSeen||0);
+          if(!prev || nextTs >= prevTs) usersByKey.set(u.key, u);
         }
       }catch(e){}
     });
-    _usersCache=users.sort((a,b)=>{
+    _usersCache=[...usersByKey.values()].sort((a,b)=>{
       const scoreDiff=(b.scores?.total||0)-(a.scores?.total||0);
       if(scoreDiff) return scoreDiff;
       const duelDiff=(b.duelsWon||0)-(a.duelsWon||0);
       if(duelDiff) return duelDiff;
-      return (b.lastSeen||0)-(a.lastSeen||0);
+      return Math.max(b.updatedAt||0,b.lastSeen||0)-Math.max(a.updatedAt||0,a.lastSeen||0);
     });
     _usersCacheTs=now;
     const sbContent=document.getElementById('sb-content');
@@ -4485,6 +4548,7 @@ async function sbPushMyStats(extra={}){
       color:_currentUser.color,
       pwHash:_currentUser.pwHash||prevData.pwHash||'',
       lastSeen:Date.now(),
+      updatedAt: Date.now(),
       online:_shouldBePresent(),
       scoreboardActive:true,
       scores,
@@ -4492,6 +4556,7 @@ async function sbPushMyStats(extra={}){
       bestStreak:Math.max(_getStoredBestStreak(),prevData.bestStreak||0),
       duelsWon:Math.max(prevData.duelsWon||0,extra.duelsWon||0),
       duelsPlayed:Math.max(prevData.duelsPlayed||0,extra.duelsPlayed||0),
+      titleIndex: Number.isInteger(extra.titleIndex) ? extra.titleIndex : (Number.isInteger(prevData.titleIndex) ? prevData.titleIndex : 0),
     },extra);
     await storageSet(_currentUser.key,JSON.stringify(userData),true);
 
@@ -4512,6 +4577,7 @@ async function sbSetOffline(){
     const d=JSON.parse(prev.value);
     d.online=false;
     d.lastSeen=Date.now();
+    d.updatedAt=Date.now();
     d.scoreboardActive = d.scoreboardActive !== false;
     await storageSet(_currentUser.key,JSON.stringify(d),true);
   }catch(e){}
@@ -4642,6 +4708,7 @@ async function sbLogout(){
         pwHash:leavingUser.pwHash||prevData.pwHash||'',
         online:false,
         lastSeen:Date.now(),
+        updatedAt:Date.now(),
         scoreboardActive:false
       });
       await storageSet(leavingUser.key,JSON.stringify(nextData),true);
@@ -4877,15 +4944,20 @@ const _sbTitleChoice = {};
 function getSbMaxUnlocked(score){ let max=0; SB_TITLES.forEach((t,i)=>{ if(score>=t.min) max=i; }); return max; }
 function getSbActiveTitle(userName, score){
   const maxIdx=getSbMaxUnlocked(score);
-  const chosen=_sbTitleChoice[userName];
+  const sharedUser = _usersCache.find(u=>(u.key||sbUserKey(u.name))===sbUserKey(userName));
+  const sharedIdx = Number.isInteger(sharedUser?.titleIndex) ? sharedUser.titleIndex : undefined;
+  const chosen = sharedIdx!==undefined ? sharedIdx : _sbTitleChoice[userName];
   if(chosen!==undefined&&chosen<=maxIdx) return SB_TITLES[chosen];
   return SB_TITLES[maxIdx];
 }
-function setSbTitle(userName, idx){
+async function setSbTitle(userName, idx){
+  if(!_currentUser || _currentUser.name!==userName) return;
   _sbTitleChoice[userName]=idx;
   try{ localStorage.setItem('prepa_title_'+userName,idx); }catch(e){}
+  await sbPushMyStats({ titleIndex: idx });
+  await _fetchAllUsers(true);
   const sbContent=document.getElementById('sb-content');
-  if(sbContent) sbLoadAll().then(users=>sbRenderList(sbContent,users));
+  if(sbContent) sbRenderList(sbContent,_usersCache);
   document.getElementById('title-picker-'+userName)?.remove();
 }
 function loadSbTitleChoice(userName){
@@ -4929,7 +5001,7 @@ function sbRenderList(container, users){
         <div style="flex:1;min-width:0">
           <div style="font-weight:600;font-size:13px;color:var(--fg)">${u.name}${isMe?' <span style="font-family:\'DM Mono\',monospace;font-size:8px;color:var(--t4)">(vous)</span>':''}</div>
           <div style="margin-top:3px;display:flex;align-items:center;flex-wrap:wrap;gap:3px">${titleBadge}${pickerBtn}</div>
-          <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--t4);margin-top:3px">🕐 ${formatLastSeen(u.lastSeen)} · 🔥 ${u.streak||0}j</div>
+          <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--t4);margin-top:3px">🕐 ${formatLastSeen(u.lastSeen)} · 🔥 ${u.streak||0}j · ⚔️ ${u.duelsWon||0}</div>
         </div>
         ${duelBtn}
         <div style="text-align:right;flex-shrink:0">
