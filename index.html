@@ -3911,6 +3911,9 @@ let _sbPushInProgress = false, _sbUserIndexed = false;
 let _presenceDesired = false, _presenceJoined = false;
 let _ablyInitPromise = null;
 let _ablySubscriptionsReady = false;
+let _ablyConnectionState = 'idle';
+let _ablyConnectionReason = '';
+let _ablyReconnectTimer = null;
 let _kvBootstrapPromise = null;
 let _profilesHydrated = false;
 let _onlineReinitDone = false;
@@ -3930,21 +3933,30 @@ const LEGACY_MIGRATION_FLAG_KEY = '__esh_prepa_online_v4_profiles_migrated__';
 const ABLY_LOADER_ATTR = 'data-ably-loader-esh-online-v4';
 
 const ONLINE_SCOPE = Object.freeze({
-  app: 'esh-prepa-scoreboard-v4',
-  clientPrefix: 'eshscorev4',
-  localPrefix: '__esh_prepa_scoreboard_v4__',
+  app: 'esh',
+  clientPrefix: 'esh',
+  localPrefix: '__esh_online_v5__',
   channels: {
-    kv: 'esh-prepa-scoreboard-v4:kv',
-    chat: 'esh-prepa-scoreboard-v4:chat',
-    profiles: 'esh-prepa-scoreboard-v4:profiles',
-    presence: 'esh-prepa-scoreboard-v4:presence',
-    duels: 'esh-prepa-scoreboard-v4:duels'
+    kv: 'esh:kv',
+    chat: 'esh:chat',
+    profiles: 'esh:profiles',
+    presence: 'esh:presence',
+    duels: 'esh:duels'
   },
   userIndexKey: 'players:index',
-  kvPrefix: 'esh-prepa-scoreboard-v4:kv:'
+  kvPrefix: 'esh:kv:'
 });
 
 const LEGACY_ONLINE_SCOPES = Object.freeze([
+  {
+    app: 'esh-prepa-scoreboard-v4',
+    channels: {
+      kv: 'esh-prepa-scoreboard-v4:kv',
+      profiles: 'esh-prepa-scoreboard-v4:profiles'
+    },
+    kvPrefix: 'esh-prepa-scoreboard-v4:kv:',
+    userIndexKey: 'players:index'
+  },
   {
     app: 'esh-prepa-scoreboard-v3',
     channels: {
@@ -4214,12 +4226,27 @@ function _extractLogicalKeyFromLocalStorageKey(rawKey){
 function _resolveChannelName(name){
   if(!name) return ONLINE_SCOPE.channels.kv;
   if(ONLINE_SCOPE.channels[name]) return ONLINE_SCOPE.channels[name];
-  if(name === 'frise:duels') return ONLINE_SCOPE.channels.duels;
-  if(name === 'frise:presence') return ONLINE_SCOPE.channels.presence;
-  if(name === 'frise:profiles') return ONLINE_SCOPE.channels.profiles;
-  if(name === 'frise:chat') return ONLINE_SCOPE.channels.chat;
-  if(name === 'frise:kv') return ONLINE_SCOPE.channels.kv;
-  return `${ONLINE_SCOPE.app}:${String(name).replace(/[^a-zA-Z0-9:_-]/g,'-')}`;
+  const raw = String(name);
+  if(Object.values(ONLINE_SCOPE.channels).includes(raw)) return raw;
+  const aliases = {
+    'esh:kv': ONLINE_SCOPE.channels.kv,
+    'esh:chat': ONLINE_SCOPE.channels.chat,
+    'esh:profiles': ONLINE_SCOPE.channels.profiles,
+    'esh:presence': ONLINE_SCOPE.channels.presence,
+    'esh:duels': ONLINE_SCOPE.channels.duels,
+    'esh-prepa-scoreboard-v4:kv': ONLINE_SCOPE.channels.kv,
+    'esh-prepa-scoreboard-v4:chat': ONLINE_SCOPE.channels.chat,
+    'esh-prepa-scoreboard-v4:profiles': ONLINE_SCOPE.channels.profiles,
+    'esh-prepa-scoreboard-v4:presence': ONLINE_SCOPE.channels.presence,
+    'esh-prepa-scoreboard-v4:duels': ONLINE_SCOPE.channels.duels,
+    'frise:kv': ONLINE_SCOPE.channels.kv,
+    'frise:chat': ONLINE_SCOPE.channels.chat,
+    'frise:profiles': ONLINE_SCOPE.channels.profiles,
+    'frise:presence': ONLINE_SCOPE.channels.presence,
+    'frise:duels': ONLINE_SCOPE.channels.duels
+  };
+  if(aliases[raw]) return aliases[raw];
+  return `${ONLINE_SCOPE.app}:${raw.replace(/[^a-zA-Z0-9:_-]/g,'-')}`;
 }
 function _ablyChannel(name){
   if(!_ably) return null;
@@ -4570,6 +4597,46 @@ async function _subscribeRealtimeChannels(){
   });
 }
 
+function _scheduleAblyReconnect(delay=2500){
+  if(_ablyReconnectTimer || _ablyReady) return;
+  _ablyReconnectTimer = setTimeout(async ()=>{
+    _ablyReconnectTimer = null;
+    try{
+      if(_ably){
+        const state = _ably.connection?.state;
+        if(['initialized','connecting','disconnected','suspended','closed'].includes(state)){
+          try{ _ably.connect(); }catch(e){}
+        }
+      }else{
+        _ablyInitPromise = null;
+        await ablyInit();
+      }
+    }catch(e){}
+    _refreshOnlineConnectionUi();
+  }, delay);
+}
+async function sbReconnectNow(){
+  try{
+    if(_ablyReconnectTimer){ clearTimeout(_ablyReconnectTimer); _ablyReconnectTimer = null; }
+  }catch(e){}
+  try{
+    const state = _ably?.connection?.state;
+    if(_ably && (state === 'failed' || state === 'closed')){
+      try{ _ably.close(); }catch(e){}
+      _ably = null;
+      _ablyChannels = {};
+      _legacyAblyChannels = {};
+      _ablySubscriptionsReady = false;
+      _ablyInitPromise = null;
+      _ablyReady = false;
+    }else if(_ably){
+      try{ _ably.connect(); }catch(e){}
+    }
+    if(!_ably) await ablyInit();
+  }catch(e){}
+  _refreshOnlineConnectionUi();
+}
+
 function _refreshOnlineConnectionUi(){
   try{ updateSbUI(); }catch(e){}
   try{ chatRenderFooter(); }catch(e){}
@@ -4582,25 +4649,44 @@ async function ablyInit(){
   if(_ablyInitPromise) return _ablyInitPromise;
   _ablyInitPromise = new Promise(resolve=>{
     const boot = ()=>_setupAbly(resolve);
-    if(typeof Ably!=='undefined'){ boot(); return; }
+    if(typeof Ably!=='undefined' && typeof Ably.Realtime!=='undefined'){ boot(); return; }
+
+    const existing = document.querySelector(`script[${ABLY_LOADER_ATTR}]`);
+    if(existing){
+      existing.addEventListener('load', ()=>{
+        if(typeof Ably!=='undefined' && typeof Ably.Realtime!=='undefined') boot();
+        else resolve();
+      }, {once:true});
+      existing.addEventListener('error', ()=>resolve(), {once:true});
+      return;
+    }
 
     const sources = [
       'https://cdn.ably.com/lib/ably.min-2.js',
-      'https://unpkg.com/ably@2/build/ably.min.js',
-      'https://cdn.jsdelivr.net/npm/ably@2/build/ably.min.js'
+      'https://cdn.jsdelivr.net/npm/ably@2/build/ably.min.js',
+      'https://unpkg.com/ably@2/build/ably.min.js'
     ];
 
     const loadFrom = (index)=>{
-      if(typeof Ably!=='undefined'){ boot(); return; }
-      if(index >= sources.length){ console.warn('[Ably] all loaders failed'); resolve(); return; }
+      if(typeof Ably!=='undefined' && typeof Ably.Realtime!=='undefined'){ boot(); return; }
+      if(index >= sources.length){
+        _ablyConnectionState = 'loader_failed';
+        _ablyConnectionReason = 'Impossible de charger la librairie Ably';
+        console.warn('[Ably] all loaders failed');
+        resolve();
+        return;
+      }
       const s=document.createElement('script');
       s.src=sources[index];
       s.async=true;
       s.crossOrigin='anonymous';
       s.setAttribute(ABLY_LOADER_ATTR, String(index + 1));
       s.onload=()=>{
-        if(typeof Ably!=='undefined') boot();
-        else loadFrom(index + 1);
+        if(typeof Ably!=='undefined' && typeof Ably.Realtime!=='undefined') boot();
+        else {
+          s.remove();
+          loadFrom(index + 1);
+        }
       };
       s.onerror=()=>{
         console.warn('[Ably] load failed:', sources[index]);
@@ -4617,75 +4703,99 @@ async function ablyInit(){
 function _setupAbly(resolve){
   try{
     if(_ably){
-      if(_ably.connection?.state === 'connected'){
-        _ablyReady = true;
-        _refreshOnlineConnectionUi();
-      }
+      _ablyConnectionState = _ably.connection?.state || 'unknown';
+      _ablyReady = _ablyConnectionState === 'connected';
+      _refreshOnlineConnectionUi();
+      if(!_ablyReady) _scheduleAblyReconnect();
       resolve();
       return;
     }
+
+    _ablyConnectionState = 'initializing';
+    _ablyConnectionReason = '';
     _ably = new Ably.Realtime({
       key: ABLY_KEY,
       clientId: `${ONLINE_SCOPE.clientPrefix}-anon-${Math.random().toString(36).slice(2,8)}`,
       closeOnUnload: true,
-      echoMessages: false
+      echoMessages: false,
+      tls: true
     });
 
     let resolved = false;
     let bootstrapping = false;
     const done = ()=>{ if(!resolved){ resolved = true; resolve(); } };
-    const fallback = setTimeout(done, 12000);
-
-    const handleConnected = async ()=>{
-      _ablyReady = true;
-      _refreshOnlineConnectionUi();
-      if(bootstrapping) return;
-      bootstrapping = true;
-      try{
-        await _subscribeRealtimeChannels();
-        await _bootstrapKvFromHistory(true);
-        await __syncPresenceMembers();
-        await __loadProfilesFromHistory(true);
-        if(_currentUser){
-          await _syncPresenceFromVisibility(true);
-          await sbPushMyStats();
-        }
-        if(_currentView==='scoreboard') await _fetchAllUsers(true);
-      }catch(e){
-        console.warn('[Ably] post-connect error:', e);
-      }finally{
-        bootstrapping = false;
-        clearTimeout(fallback);
+    const watchdog = setTimeout(()=>{
+      if(!_ablyReady){
+        _ablyConnectionState = _ably?.connection?.state || 'connecting';
+        _scheduleAblyReconnect(1000);
         _refreshOnlineConnectionUi();
-        done();
       }
-    };
+      done();
+    }, 10000);
 
-    const handleUnavailable = (label, err)=>{
-      _ablyReady = false;
-      _presenceJoined = false;
-      if(label === 'failed') console.warn('[Ably] connection failed', err || '');
+    const handleState = async (stateChange={})=>{
+      const current = stateChange.current || _ably?.connection?.state || 'unknown';
+      _ablyConnectionState = current;
+      _ablyConnectionReason = stateChange?.reason?.message || stateChange?.reason?.code || '';
+      _ablyReady = current === 'connected';
+      if(!_ablyReady) _presenceJoined = false;
       _refreshOnlineConnectionUi();
-      if(label === 'failed'){
-        clearTimeout(fallback);
+
+      if(current === 'connected'){
+        if(bootstrapping) return;
+        bootstrapping = true;
+        try{
+          await _subscribeRealtimeChannels();
+          await _bootstrapKvFromHistory(true);
+          await __syncPresenceMembers();
+          await __loadProfilesFromHistory(true);
+          if(_currentUser){
+            await _syncPresenceFromVisibility(true);
+            await sbPushMyStats();
+          }
+          if(_currentView==='scoreboard') await _fetchAllUsers(true);
+        }catch(e){
+          console.warn('[Ably] post-connect error:', e);
+          _ablyConnectionReason = e?.message || String(e);
+        }finally{
+          bootstrapping = false;
+          clearTimeout(watchdog);
+          _refreshOnlineConnectionUi();
+          done();
+        }
+        return;
+      }
+
+      if(current === 'failed'){
+        clearTimeout(watchdog);
         done();
+        return;
+      }
+
+      if(['initialized','connecting','disconnected','suspended','closed'].includes(current)){
+        _scheduleAblyReconnect();
       }
     };
 
-    _ably.connection.on('connected', handleConnected);
-    _ably.connection.on('disconnected', ()=>handleUnavailable('disconnected'));
-    _ably.connection.on('suspended', ()=>handleUnavailable('suspended'));
-    _ably.connection.on('failed', err=>handleUnavailable('failed', err));
+    _ably.connection.on(handleState);
 
     const state = _ably.connection.state;
+    _ablyConnectionState = state || 'initialized';
+    _refreshOnlineConnectionUi();
+
     if(state === 'connected'){
-      Promise.resolve().then(handleConnected);
+      Promise.resolve().then(()=>handleState({current:'connected'}));
     }else if(state === 'failed'){
-      handleUnavailable('failed');
-    }else if(['initialized','disconnected','suspended','closed'].includes(state)){
+      handleState({current:'failed', reason:_ably.connection.errorReason || null});
+    }else{
       try{ _ably.connect(); }catch(e){ console.warn('[Ably] connect() error:', e); }
     }
-  }catch(e){ console.warn('[Ably] setup error:', e); resolve(); }
+  }catch(e){
+    _ablyConnectionState = 'setup_error';
+    _ablyConnectionReason = e?.message || String(e);
+    console.warn('[Ably] setup error:', e);
+    resolve();
+  }
 }
 
 async function _presenceEnter(){
@@ -5142,9 +5252,14 @@ async function renderScoreboard(container){
   if(!sbContent) return;
 
   if(!_ablyReady){
+    const ablyState = _ablyConnectionState || (_ably?.connection?.state || 'initialisation');
+    const ablyReason = _ablyConnectionReason ? `<div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--t4);margin-top:8px;line-height:1.7">${String(_ablyConnectionReason)}</div>` : '';
     sbContent.innerHTML = `<div style="text-align:center;padding:32px 20px;background:var(--s2);border:1px solid var(--bd);border-radius:var(--r)">
       <div style="font-size:24px;margin-bottom:12px">⏳</div>
-      <div style="font-family:'DM Mono',monospace;font-size:10px;color:var(--t3);line-height:2">Connexion au serveur en cours…</div></div>`;
+      <div style="font-family:'DM Mono',monospace;font-size:10px;color:var(--t3);line-height:2">Connexion au serveur en cours…</div>
+      <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--gold2);margin-top:8px">État Ably : ${ablyState}</div>
+      ${ablyReason}
+      <button class="qnbtn qng" onclick="sbReconnectNow()" style="margin-top:14px;font-size:10px;padding:6px 12px">Relancer la connexion</button></div>`;
     return;
   }
 
@@ -5369,7 +5484,7 @@ async function startDuelGame(opponentName){
 function _startDuelAblyPush(opponentName){
   if(_duelGamePollTimer){ clearInterval(_duelGamePollTimer); _duelGamePollTimer=null; }
   // Subscribe aux updates du duel via canal KV Ably
-  const kvCh=_ablyChannel('frise:kv');
+  const kvCh=_ablyChannel('kv');
   if(kvCh){
     kvCh.subscribe('set', async (msg)=>{
       if(!msg.data || !_matchesStorageEventKey(msg.data.key, _duelResultKey)) return;
@@ -6801,7 +6916,7 @@ function _chatRefreshBadge(){
 async function _loadChatHistory(){
   if(!_ablyReady||_chatHistoryLoaded) return;
   try{
-    const ch=_ablyChannel('frise:chat');
+    const ch=_ablyChannel('chat');
     const page=await ch.history({limit:CHAT_MAX,direction:'backwards'});
     const items=(page?.items||[]).reverse();
     const now=Date.now();
@@ -6823,7 +6938,7 @@ async function _loadChatHistory(){
 }
 
 // chatPoll et chatStartPoll sont devenus no-op — chat via pub/sub Ably
-async function chatPoll(force=false){ /* no-op — chat géré par frise:chat subscribe */ }
+async function chatPoll(force=false){ /* no-op — chat géré par esh:chat subscribe */ }
 function chatStartPoll(){ /* no-op */ }
 function chatStopPoll(){
   if(_chatPollTimer){ clearInterval(_chatPollTimer); _chatPollTimer=null; }
@@ -6909,7 +7024,7 @@ async function chatSend(){
   try{
     const msg={ts:Date.now(),author:_currentUser.name,color:_currentUser.color,text};
     // Publier via Ably pub/sub — reçu instantanément par tous via subscribe
-    await _ablyChannel('frise:chat').publish('msg',msg);
+    await _ablyChannel('chat').publish('msg',msg);
     // Ajouter localement immédiatement
     const exists=_chatMsgs.some(x=>x.ts===msg.ts&&x.author===msg.author);
     if(!exists){
