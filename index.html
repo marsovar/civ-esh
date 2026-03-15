@@ -4237,6 +4237,17 @@ async function _fetchAllUsers(force){
 }
 async function sbLoadAll(){ return _fetchAllUsers(false); }
 
+// ─── Supprimer les warnings XHR internes d'Ably ───────────────
+(function(){
+  const _origWarn = console.warn.bind(console);
+  console.warn = function(...args){
+    const msg = String(args[0]||'');
+    if(msg.includes('Ably:') && msg.includes('XHR error')) return;
+    if(msg.includes('Ably:') && msg.includes('onerror')) return;
+    _origWarn(...args);
+  };
+})();
+
 // ─── Init Ably ─────────────────────────────────────────────────
 async function ablyInit(){
   return new Promise(resolve=>{
@@ -4289,15 +4300,7 @@ function _setupAbly(resolve){
     _ablyChannels={};
     _ably=new Ably.Realtime({
       key: ABLY_KEY,
-      clientId: 'esh-anon-'+Math.random().toString(36).slice(2,8),
-      closeOnUnload: true,
-      echoMessages: false,
-      tls: true,
-      transports: ['web_socket'],
-      fallbackHosts: [],
-      disconnectedRetryTimeout: 4000,
-      suspendedRetryTimeout: 12000,
-      logLevel: 0
+      clientId: 'esh-anon-'+Math.random().toString(36).slice(2,8)
     });
     let resolved=false;
     const finish=()=>{ if(!resolved){ resolved=true; resolve(); } };
@@ -4308,6 +4311,8 @@ function _setupAbly(resolve){
       _ablyReady=true;
       _bootstrapKVFromLocalStorage();
 
+      // Retirer la bannière de connexion en cours si présente
+      document.getElementById('sb-conn-banner')?.remove();
       // Abonner au canal KV
       try{
         const kvCh=_ablyChannel(ONLINE_KV_CHANNEL);
@@ -4409,6 +4414,15 @@ function _setupAbly(resolve){
       if(_currentUser){
         await _syncPresenceFromVisibility();
         await sbPushMyStats();
+      }
+      // Rafraîchir le scoreboard si ouvert (retirera la bannière "connexion en cours")
+      if(_currentView==='scoreboard'){
+        try{
+          const users=await _fetchAllUsers(true);
+          const el=document.getElementById('sb-content');
+          if(el) sbRenderList(el, users);
+          updateOnlineCount();
+        }catch(e){}
       }
       clearTimeout(watchdog);
       finish();
@@ -4794,15 +4808,25 @@ async function renderScoreboard(container){
        </div>`
     : `<button class="qnbtn qng" onclick="showLoginModal()">🏆 Rejoindre</button>`;
 
+  // Bannière de statut connexion (non-bloquante)
+  const connBanner = !_ablyReady
+    ? `<div id="sb-conn-banner" style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:rgba(201,160,50,.08);border:1px solid rgba(201,160,50,.2);border-radius:6px;margin-bottom:10px">
+        <div style="width:8px;height:8px;border-radius:50%;border:2px solid var(--gold2);border-top-color:transparent;animation:spin .8s linear infinite;flex-shrink:0"></div>
+        <span style="font-family:'DM Mono',monospace;font-size:9px;color:var(--gold2)">Connexion au serveur en cours…</span>
+        <button onclick="sbReconnectNow()" style="margin-left:auto;font-family:'DM Mono',monospace;font-size:8px;padding:2px 8px;background:transparent;border:1px solid rgba(201,160,50,.3);border-radius:4px;color:var(--gold2);cursor:pointer">Relancer</button>
+      </div>`
+    : '';
+
   container.innerHTML = `<div class="content-inner">
     <div class="ph">
       <div class="ph-l"><div class="ph-eye">Classement</div><div class="ph-title">Scoreboard</div>
         <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--t4);margin-top:4px">Progression partagée · temps réel</div>
-        <div id="sb-online-count" style="font-family:'DM Mono',monospace;font-size:9px;color:#2ecc71;margin-top:3px">— utilisateurs En ligne</div>
+        <div id="sb-online-count" style="font-family:'DM Mono',monospace;font-size:9px;color:#2ecc71;margin-top:3px">— utilisateurs en ligne</div>
       </div>
       ${meHtml}
     </div>
-    <div id="sb-content" style="margin-top:12px">
+    ${connBanner}
+    <div id="sb-content" style="margin-top:4px">
       <div style="text-align:center;padding:32px;color:var(--t4);font-family:'DM Mono',monospace;font-size:11px">Chargement…</div>
     </div>
   </div>`;
@@ -4810,26 +4834,17 @@ async function renderScoreboard(container){
   const sbContent = document.getElementById('sb-content');
   if(!sbContent) return;
 
-  if(!_ablyReady){
-    const ablyState = (_ably?.connection?.state) || 'connexion en cours…';
-    const ablyReason = '';
-    sbContent.innerHTML = `<div style="text-align:center;padding:32px 20px;background:var(--s2);border:1px solid var(--bd);border-radius:var(--r)">
-      <div style="font-size:24px;margin-bottom:12px">⏳</div>
-      <div style="font-family:'DM Mono',monospace;font-size:10px;color:var(--t3);line-height:2">Connexion au serveur en cours…</div>
-      <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--gold2);margin-top:8px">État Ably : ${ablyState}</div>
-      ${ablyReason}
-      <button class="qnbtn qng" onclick="sbReconnectNow()" style="margin-top:14px;font-size:10px;padding:6px 12px">Relancer la connexion</button></div>`;
-    return;
-  }
-
+  // Afficher le cache local immédiatement même hors-ligne
   if(_usersCache.length) sbRenderList(sbContent, _usersCache);
-  else sbContent.innerHTML = `<div style="text-align:center;padding:32px;color:var(--t4);font-family:'DM Mono',monospace;font-size:11px">Chargement…</div>`;
+  else if(!_ablyReady) sbContent.innerHTML = `<div style="text-align:center;padding:32px;color:var(--t4);font-family:'DM Mono',monospace;font-size:11px">Les scores se chargeront dès la connexion établie.</div>`;
 
-  _fetchAllUsers(true).then(users => {
-    const el = document.getElementById('sb-content');
-    if(el) sbRenderList(el, users);
-  });
-  updateOnlineCount();
+  if(_ablyReady){
+    _fetchAllUsers(true).then(users => {
+      const el = document.getElementById('sb-content');
+      if(el) sbRenderList(el, users);
+    });
+    updateOnlineCount();
+  }
 }
 
 const SB_TITLES = [
