@@ -3889,11 +3889,12 @@ function loadQuizConfig(){
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  ONLINE — NOYAU ABLY RECONSTRUIT À PARTIR DU MODÈLE INDEXMATH
+//  ONLINE — NOYAU ABLY V4 REPRIS DE ZÉRO
 //  • Profils persistants séparés de la présence temps réel
-//  • Le scoreboard contient tous les comptes tant qu'ils ne se déconnectent pas
-//  • Les duels ne sont proposés qu'aux joueurs réellement présents
-//  • Namespace Ably dédié à ce site, distinct des autres projets
+//  • Tous les comptes restent visibles dans le scoreboard
+//  • Seule la déconnexion retire un joueur du scoreboard
+//  • Namespace Ably strictement dédié à ce site
+//  • Migration douce des anciens profils v3 vers v4
 // ══════════════════════════════════════════════════════════════════
 let _currentUser = null;
 let _sbExpanded = null;
@@ -3902,6 +3903,7 @@ let _onlineHeartbeat = null;
 let _ablyReady = false;
 let _ably = null;
 let _ablyChannels = {};
+let _legacyAblyChannels = {};
 let _kv = {};
 let _presenceMembers = {};
 let _usersCache = [], _usersCacheTs = 0;
@@ -3912,52 +3914,47 @@ let _ablySubscriptionsReady = false;
 let _kvBootstrapPromise = null;
 let _profilesHydrated = false;
 let _onlineReinitDone = false;
+let _legacyMigrationPromise = null;
 
 const POLL_INTERVAL_ACTIVE = 6000;
 const POLL_INTERVAL_NORMAL = 12000;
 const POLL_INTERVAL_BG = 45000;
-const USERS_CACHE_TTL_ACTIVE = 4000;
-const USERS_CACHE_TTL_NORMAL = 10000;
-const USERS_CACHE_TTL_BG = 45000;
 const LOCAL_PROFILE_CACHE_TTL = 60 * 1000;
 const USER_COLORS = ['#2a7a8f','#2d7a5f','#c0392b','#6b4fa8','#b8922a','#1a6a9a','#7a4a9f','#1a8a62','#9a6a28'];
 const ABLY_KEY = 'omrAsg.61E1oQ:sJXWtnTzOlCdLP2t44fhmBB1RyMPURSJQJLNOPwccR8';
-const LOGIN_USER_STORAGE_KEY = 'esh_eco_username_v3';
-const LOGIN_PW_STORAGE_KEY = 'esh_eco_pwhash_v3';
-const LOCAL_PROFILE_INDEX_KEY = '__esh_eco_profile_index_v3';
-const LOCAL_PROFILE_PREFIX = '__esh_eco_profile_v3_';
+const LOGIN_USER_STORAGE_KEY = 'esh_eco_username_v4';
+const LOGIN_PW_STORAGE_KEY = 'esh_eco_pwhash_v4';
+const LOCAL_PROFILE_INDEX_KEY = '__esh_eco_profile_index_v4';
+const LOCAL_PROFILE_PREFIX = '__esh_eco_profile_v4_';
+const LEGACY_MIGRATION_FLAG_KEY = '__esh_prepa_online_v4_profiles_migrated__';
+const ABLY_LOADER_ATTR = 'data-ably-loader-esh-online-v4';
 
 const ONLINE_SCOPE = Object.freeze({
-  app: 'esh-prepa-scoreboard-v3',
-  clientPrefix: 'eshscore',
-  localPrefix: '__esh_prepa_scoreboard_v3__',
+  app: 'esh-prepa-scoreboard-v4',
+  clientPrefix: 'eshscorev4',
+  localPrefix: '__esh_prepa_scoreboard_v4__',
   channels: {
-    kv: 'esh-prepa-scoreboard-v3:kv',
-    chat: 'esh-prepa-scoreboard-v3:chat',
-    profiles: 'esh-prepa-scoreboard-v3:profiles',
-    presence: 'esh-prepa-scoreboard-v3:presence',
-    duels: 'esh-prepa-scoreboard-v3:duels'
-  },
-  aliases: {
-    'frise:kv': 'esh-prepa-scoreboard-v3:kv',
-    'ecg:kv': 'esh-prepa-scoreboard-v3:kv',
-    'kv': 'esh-prepa-scoreboard-v3:kv',
-    'frise:chat': 'esh-prepa-scoreboard-v3:chat',
-    'ecg:chat': 'esh-prepa-scoreboard-v3:chat',
-    'chat': 'esh-prepa-scoreboard-v3:chat',
-    'frise:profiles': 'esh-prepa-scoreboard-v3:profiles',
-    'ecg:profiles': 'esh-prepa-scoreboard-v3:profiles',
-    'profiles': 'esh-prepa-scoreboard-v3:profiles',
-    'frise:presence': 'esh-prepa-scoreboard-v3:presence',
-    'ecg:presence': 'esh-prepa-scoreboard-v3:presence',
-    'presence': 'esh-prepa-scoreboard-v3:presence',
-    'frise:duels': 'esh-prepa-scoreboard-v3:duels',
-    'ecg:duels': 'esh-prepa-scoreboard-v3:duels',
-    'duels': 'esh-prepa-scoreboard-v3:duels'
+    kv: 'esh-prepa-scoreboard-v4:kv',
+    chat: 'esh-prepa-scoreboard-v4:chat',
+    profiles: 'esh-prepa-scoreboard-v4:profiles',
+    presence: 'esh-prepa-scoreboard-v4:presence',
+    duels: 'esh-prepa-scoreboard-v4:duels'
   },
   userIndexKey: 'players:index',
-  kvPrefix: 'esh-prepa-scoreboard-v3:kv:'
+  kvPrefix: 'esh-prepa-scoreboard-v4:kv:'
 });
+
+const LEGACY_ONLINE_SCOPES = Object.freeze([
+  {
+    app: 'esh-prepa-scoreboard-v3',
+    channels: {
+      kv: 'esh-prepa-scoreboard-v3:kv',
+      profiles: 'esh-prepa-scoreboard-v3:profiles'
+    },
+    kvPrefix: 'esh-prepa-scoreboard-v3:kv:',
+    userIndexKey: 'players:index'
+  }
+]);
 
 let _tabFocused = !document.hidden && document.hasFocus();
 document.addEventListener('visibilitychange', ()=>{ _tabFocused = !document.hidden && document.hasFocus(); });
@@ -3965,10 +3962,17 @@ window.addEventListener('focus', ()=>{ _tabFocused = !document.hidden; });
 window.addEventListener('blur', ()=>{ _tabFocused = false; });
 
 function _safeSlug(value){
-  return (value||'').toString().trim().toLowerCase().replace(/[^a-z0-9]/g,'_');
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 40);
 }
 function __normName(name){
-  return String(name || '').trim().replace(/\s+/g,' ').slice(0,20);
+  return String(name || '').trim().replace(/\s+/g, ' ').slice(0,20);
 }
 function sbUserKey(name){ return 'players:' + _safeSlug(name); }
 function _userPresenceKey(input){
@@ -3987,7 +3991,8 @@ function _presencePayload(){
     ts: Date.now(),
     view: _currentView || 'scoreboard',
     visible: document.visibilityState === 'visible',
-    focused: document.hasFocus()
+    focused: document.hasFocus(),
+    path: location.pathname || '/'
   };
 }
 function _getPresenceUserKeys(){
@@ -4002,7 +4007,7 @@ function isUserOnline(name){
 function isOnline(u){ return u && isUserOnline(u.name); }
 function isOnlinePres(u){ return u && isUserOnline(u.name); }
 function _isPagePresent(){
-  return !!(_currentUser && _ablyReady && document.visibilityState === 'visible' && document.hasFocus());
+  return !!(_currentUser && _ablyReady && document.visibilityState === 'visible');
 }
 function _shouldBePresent(){
   return _isPagePresent();
@@ -4094,6 +4099,7 @@ function __mergeProfile(profile, opts){
   opts = opts || {};
   if(!profile || !profile.name) return null;
   const cleanName = __normName(profile.name);
+  if(!cleanName) return null;
   const fallbackColor = USER_COLORS[Math.abs(cleanName.split('').reduce((a,ch)=>a+ch.charCodeAt(0),0)) % USER_COLORS.length];
   const defaults = __buildEmptyScores();
   const normalized = {
@@ -4135,11 +4141,12 @@ function __mergeProfile(profile, opts){
   return normalized;
 }
 async function __publishProfile(profile){
+  if(!_ablyReady || !_ably) return null;
   const snapshot = Object.assign({}, profile, {
     name: __normName(profile.name),
     key: profile.key || sbUserKey(profile.name),
     updatedAt: Date.now(),
-    lastSeen: Date.now()
+    lastSeen: profile.lastSeen || Date.now()
   });
   snapshot.titleIndex = _normalizeTitleIndex(snapshot.titleIndex, snapshot.scores?.total || 0);
   __mergeProfile(snapshot, {persist:true});
@@ -4160,13 +4167,15 @@ function _normalizeLogicalKey(key){
   if(key === ONLINE_SCOPE.userIndexKey || key.startsWith('players:')) return key;
   if(key === 'frise_users:index') return ONLINE_SCOPE.userIndexKey;
   if(key.startsWith('frise_users:')) return 'players:' + key.slice('frise_users:'.length);
+  if(key.startsWith('esh_duel_result:')) return 'duel_result:' + key.slice('esh_duel_result:'.length);
   if(key.startsWith('frise_duel_result:')) return 'duel_result:' + key.slice('frise_duel_result:'.length);
+  if(key.startsWith('esh_duel:')) return 'duel:' + key.slice('esh_duel:'.length);
   if(key.startsWith('frise_duel:')) return 'duel:' + key.slice('frise_duel:'.length);
   if(key === 'frise_dq_results') return 'daily_quiz_results';
   if(key === 'frise_chat:messages') return 'chat_messages';
   if(key.startsWith('frise_reactions:')) return 'reactions:' + key.slice('frise_reactions:'.length);
   if(key.startsWith('frise_')) return key.slice('frise_'.length);
-  return key;
+  return String(key).trim();
 }
 function _physicalKvKey(logicalKey){
   return ONLINE_SCOPE.kvPrefix + _normalizeLogicalKey(logicalKey);
@@ -4204,16 +4213,32 @@ function _extractLogicalKeyFromLocalStorageKey(rawKey){
 
 function _resolveChannelName(name){
   if(!name) return ONLINE_SCOPE.channels.kv;
-  return ONLINE_SCOPE.aliases[name] || ONLINE_SCOPE.channels[name] || `${ONLINE_SCOPE.app}:${String(name).replace(/[^a-zA-Z0-9:_-]/g,'-')}`;
+  if(ONLINE_SCOPE.channels[name]) return ONLINE_SCOPE.channels[name];
+  if(name === 'frise:duels') return ONLINE_SCOPE.channels.duels;
+  if(name === 'frise:presence') return ONLINE_SCOPE.channels.presence;
+  if(name === 'frise:profiles') return ONLINE_SCOPE.channels.profiles;
+  if(name === 'frise:chat') return ONLINE_SCOPE.channels.chat;
+  if(name === 'frise:kv') return ONLINE_SCOPE.channels.kv;
+  return `${ONLINE_SCOPE.app}:${String(name).replace(/[^a-zA-Z0-9:_-]/g,'-')}`;
 }
 function _ablyChannel(name){
   if(!_ably) return null;
   const resolved = _resolveChannelName(name);
   if(!_ablyChannels[resolved]){
-    const opts = resolved === ONLINE_SCOPE.channels.profiles ? {params:{rewind:'100'}} : {};
+    const opts = resolved === ONLINE_SCOPE.channels.profiles ? {params:{rewind:'200'}} : {};
     _ablyChannels[resolved] = _ably.channels.get(resolved, opts);
   }
   return _ablyChannels[resolved];
+}
+function _legacyScopeChannel(scope, name){
+  if(!_ably || !scope?.channels?.[name]) return null;
+  const resolved = scope.channels[name];
+  const cacheKey = `${scope.app}:${resolved}`;
+  if(!_legacyAblyChannels[cacheKey]){
+    const opts = name === 'profiles' ? {params:{rewind:'200'}} : {};
+    _legacyAblyChannels[cacheKey] = _ably.channels.get(resolved, opts);
+  }
+  return _legacyAblyChannels[cacheKey];
 }
 
 async function storageSet(key,value,shared){
@@ -4221,7 +4246,7 @@ async function storageSet(key,value,shared){
   const physical = _physicalKvKey(logical);
   _kv[logical]=value;
   _persistCriticalKv(logical, value);
-  if(_ablyReady) try{ await _ablyChannel('kv').publish('set',{key:physical,value}); }catch(e){}
+  if(_ablyReady) try{ await _ablyChannel('kv').publish('set',{key:physical,value,ts:Date.now()}); }catch(e){}
   return {key:logical,value};
 }
 async function storageGet(key,shared){
@@ -4279,7 +4304,100 @@ async function _bootstrapKvFromHistory(force=false){
   return result;
 }
 
-async function __loadProfilesFromLegacyKV(){
+async function _historyFoldByLatest(channel, eventName, nameSelector){
+  const byKey = new Map();
+  try{
+    let page = await channel.history({limit:1000, direction:'backwards'});
+    do{
+      for(const msg of (page?.items || [])){
+        if(eventName && msg.name !== eventName) continue;
+        const data = msg.data;
+        const key = nameSelector(data, msg);
+        if(!key) continue;
+        if(byKey.has(key)) continue;
+        byKey.set(key, data);
+      }
+      if(page?.hasNext()) page = await page.next(); else break;
+    }while(page);
+  }catch(e){}
+  return Array.from(byKey.values());
+}
+
+async function __loadProfilesFromLegacyKV(scope){
+  try{
+    const kvCh = _legacyScopeChannel(scope, 'kv');
+    if(!kvCh) return;
+    const seenPhysical = new Set();
+    const legacyKv = {};
+    let page = await kvCh.history({limit:1000,direction:'backwards'});
+    do{
+      for(const msg of (page?.items || [])){
+        if(msg.name !== 'set' || !msg.data?.key || seenPhysical.has(msg.data.key)) continue;
+        seenPhysical.add(msg.data.key);
+        if(!String(msg.data.key).startsWith(scope.kvPrefix)) continue;
+        const logical = String(msg.data.key).slice(scope.kvPrefix.length);
+        legacyKv[logical] = msg.data.value;
+      }
+      if(page?.hasNext()) page = await page.next(); else break;
+    }while(page);
+
+    let keys = [];
+    try{
+      const idxRaw = legacyKv[scope.userIndexKey];
+      if(idxRaw){
+        const idx = JSON.parse(idxRaw || '{}');
+        if(Array.isArray(idx.keys)) keys = idx.keys.slice();
+      }
+    }catch(e){}
+    if(!keys.length) keys = Object.keys(legacyKv).filter(k => k.startsWith('players:'));
+    [...new Set(keys.filter(Boolean))].forEach(k => {
+      try{
+        const raw = legacyKv[k];
+        if(!raw) return;
+        const profile = JSON.parse(raw);
+        if(profile?.name) __mergeProfile(profile, {persist:true});
+      }catch(e){}
+    });
+  }catch(e){}
+}
+
+async function _migrateLegacyProfilesOnce(){
+  if(_legacyMigrationPromise) return _legacyMigrationPromise;
+  if(localStorage.getItem(LEGACY_MIGRATION_FLAG_KEY) === '1') return;
+  if(!_ablyReady) return;
+  _legacyMigrationPromise = (async()=>{
+    try{
+      for(const scope of LEGACY_ONLINE_SCOPES){
+        const profileCh = _legacyScopeChannel(scope, 'profiles');
+        if(profileCh){
+          const legacyProfiles = await _historyFoldByLatest(profileCh, 'profile.upsert', data => data?.name ? __normName(data.name).toLowerCase() : '');
+          legacyProfiles.forEach(profile => { if(profile?.name) __mergeProfile(profile, {persist:true}); });
+        }
+        await __loadProfilesFromLegacyKV(scope);
+      }
+      const seed = _usersCache.slice();
+      for(const profile of seed){
+        if(!profile?.name || profile.scoreboardActive === false) continue;
+        try{ await __publishProfile(profile); }catch(e){}
+      }
+      localStorage.setItem(LEGACY_MIGRATION_FLAG_KEY, '1');
+    }catch(e){
+      console.warn('[online] legacy migration error:', e);
+    }finally{
+      _legacyMigrationPromise = null;
+    }
+  })();
+  return _legacyMigrationPromise;
+}
+
+async function __loadProfilesFromCurrentNamespace(){
+  try{
+    const profiles = await _historyFoldByLatest(_ablyChannel('profiles'), 'profile.upsert', data => data?.name ? __normName(data.name).toLowerCase() : '');
+    profiles.forEach(profile => { if(profile?.name) __mergeProfile(profile, {persist:true}); });
+  }catch(e){
+    console.warn('[online] profile history load error:', e);
+  }
+
   try{
     const idxRaw = await storageGet(ONLINE_SCOPE.userIndexKey, true);
     let keys = [];
@@ -4293,37 +4411,20 @@ async function __loadProfilesFromLegacyKV(){
       if(!raw) return;
       try{
         const profile = JSON.parse(raw.value);
-        if(profile && profile.name) __mergeProfile(profile, {persist:true});
+        if(profile?.name) __mergeProfile(profile, {persist:true});
       }catch(e){}
     });
   }catch(e){}
 }
+
 async function __loadProfilesFromHistory(force){
   const now = Date.now();
   if(_profilesHydrated && !force && _usersCache.length && (now - _usersCacheTs) < LOCAL_PROFILE_CACHE_TTL) return _usersCache;
   __loadLocalProfiles().forEach(profile => __mergeProfile(profile, {persist:false}));
   if(!_ablyReady) return _usersCache;
-  try{
-    let page = await _ablyChannel('profiles').history({limit:1000, direction:'backwards'});
-    const byName = new Map();
-    do{
-      for(const msg of (page?.items || [])){
-        if(msg.name !== 'profile.upsert' || !msg.data?.name) continue;
-        const profile = msg.data;
-        const key = __normName(profile.name).toLowerCase();
-        const prev = byName.get(key);
-        const nextTs = profile.updatedAt || profile.lastSeen || 0;
-        const prevTs = prev ? (prev.updatedAt || prev.lastSeen || 0) : -1;
-        if(!prev || nextTs >= prevTs) byName.set(key, profile);
-      }
-      if(page?.hasNext()) page = await page.next(); else break;
-    }while(page);
-    Array.from(byName.values()).forEach(profile => __mergeProfile(profile, {persist:true}));
-    _profilesHydrated = true;
-  }catch(e){
-    console.warn('[online] profile history load error:', e);
-  }
-  await __loadProfilesFromLegacyKV();
+  await __loadProfilesFromCurrentNamespace();
+  await _migrateLegacyProfilesOnce();
+  _profilesHydrated = true;
   return _usersCache;
 }
 async function _fetchAllUsers(force=false){
@@ -4387,7 +4488,13 @@ async function _subscribeRealtimeChannels(){
     _kv[logical] = msg.data.value;
     _persistCriticalKv(logical, msg.data.value);
     if(logical.startsWith('players:') && logical !== ONLINE_SCOPE.userIndexKey) _onAblyUserUpdate(msg.data.value);
-    if(logical === ONLINE_SCOPE.userIndexKey && _currentView === 'scoreboard') _fetchAllUsers(true);
+    if(logical === ONLINE_SCOPE.userIndexKey){
+      _usersCacheTs = 0;
+      if(_currentView === 'scoreboard') _fetchAllUsers(true).then(users=>{
+        const el = document.getElementById('sb-content');
+        if(el && typeof sbRenderList === 'function') sbRenderList(el, users);
+      });
+    }
   });
 
   const chatCh = _ablyChannel('chat');
@@ -4468,7 +4575,7 @@ async function ablyInit(){
   _ablyInitPromise = new Promise(resolve=>{
     const boot = ()=>_setupAbly(resolve);
     if(typeof Ably!=='undefined'){ boot(); return; }
-    const existing = document.querySelector('script[data-ably-loader="1"]');
+    const existing = document.querySelector(`script[${ABLY_LOADER_ATTR}="1"]`);
     if(existing){
       existing.addEventListener('load', boot, {once:true});
       existing.addEventListener('error', ()=>resolve(), {once:true});
@@ -4476,7 +4583,7 @@ async function ablyInit(){
     }
     const s=document.createElement('script');
     s.src='https://cdn.ably.com/lib/ably.min-2.js';
-    s.dataset.ablyLoader = '1';
+    s.setAttribute(ABLY_LOADER_ATTR, '1');
     s.onload=boot;
     s.onerror=()=>{ console.warn('[Ably] load failed'); resolve(); };
     document.head.appendChild(s);
@@ -4488,14 +4595,18 @@ function _setupAbly(resolve){
     if(_ably){ resolve(); return; }
     _ably = new Ably.Realtime({
       key: ABLY_KEY,
-      clientId: `${ONLINE_SCOPE.clientPrefix}-anon-${Math.random().toString(36).slice(2,8)}`
+      clientId: `${ONLINE_SCOPE.clientPrefix}-anon-${Math.random().toString(36).slice(2,8)}`,
+      closeOnUnload: true,
+      echoMessages: false
     });
 
     let resolved = false;
     const done = ()=>{ if(!resolved){ resolved = true; resolve(); } };
+    const fallback = setTimeout(done, 8000);
 
     _ably.connection.on('connected', async ()=>{
       _ablyReady = true;
+      clearTimeout(fallback);
       await _subscribeRealtimeChannels();
       await _bootstrapKvFromHistory(true);
       await __syncPresenceMembers();
@@ -4509,7 +4620,7 @@ function _setupAbly(resolve){
     });
     _ably.connection.on('disconnected', ()=>{ _ablyReady = false; _presenceJoined=false; });
     _ably.connection.on('suspended', ()=>{ _ablyReady = false; _presenceJoined=false; });
-    _ably.connection.on('failed', ()=>{ _ablyReady = false; _presenceJoined=false; console.warn('[Ably] connection failed'); done(); });
+    _ably.connection.on('failed', ()=>{ _ablyReady = false; _presenceJoined=false; console.warn('[Ably] connection failed'); clearTimeout(fallback); done(); });
   }catch(e){ console.warn('[Ably] setup error:', e); resolve(); }
 }
 
@@ -4609,10 +4720,10 @@ async function sbPushMyStats(extra={}){
     Object.entries(MODULES).forEach(([mk,m])=>
       Object.entries(m.parties).forEach(([pk,p])=>{ scores[pk]=Math.round(mastHybridPct(p.refs)*10)/10; })
     );
-    const prevLegacy = await storageGet(_currentUser.key, true).catch(()=>null);
-    let legacyData = {};
-    try{ if(prevLegacy?.value) legacyData = JSON.parse(prevLegacy.value); }catch(e){}
-    const base = current || legacyData || {};
+    const prevStored = await storageGet(_currentUser.key, true).catch(()=>null);
+    let storedData = {};
+    try{ if(prevStored?.value) storedData = JSON.parse(prevStored.value); }catch(e){}
+    const base = current || storedData || {};
     const localTitle = _getStoredTitleIndex(_currentUser.name);
     const chosenTitle = Number.isInteger(extra.titleIndex)
       ? extra.titleIndex
@@ -4768,8 +4879,7 @@ async function sbLogout(){
       updatedAt: Date.now(),
       titleIndex: _normalizeTitleIndex(existing.titleIndex, existing.scores?.total || 0)
     });
-    try{ await _ablyChannel('profiles').publish('profile.upsert', hidden); }catch(e){}
-    try{ await storageSet(prevUser.key, JSON.stringify(hidden), true); }catch(e){}
+    try{ await __publishProfile(hidden); }catch(e){}
     __saveProfileLocal(hidden);
     _usersCache = _usersCache.filter(u => u && u.name !== prevUser.name);
     _usersCacheTs = Date.now();
@@ -4866,20 +4976,17 @@ function _showToast(msg, color='var(--navy)'){
 let _duelPollTimer=null;
 function sbPollDuel(){ /* legacy — remplacé par Ably push */ }
 
-function duelKey(a,b){ return 'frise_duel:'+sbUserKey(a)+':'+sbUserKey(b); }
+function duelKey(a,b){ return 'esh_duel:'+sbUserKey(a)+':'+sbUserKey(b); }
 
 async function sbRequestDuel(targetName){
   if(!_currentUser||!_ablyReady) return;
   if(_duelState){ _showToast('Un duel est déjà en cours.', 'var(--red)'); return; }
   if(!isUserOnline(targetName)){ _showToast(targetName+" n'est pas en ligne.", 'var(--red)'); return; }
   const key=duelKey(_currentUser.name,targetName);
-  // Afficher écran d'attente
   sbShowDuelWaiting(targetName, key);
   _duelState={role:'challenger',key,opponent:targetName};
-  // Écrire l'invite dans KV + broadcast push
   await storageSet(key,JSON.stringify({from:_currentUser.name,to:targetName,status:'pending',ts:Date.now()}),true);
-  try{ await _ablyChannel('frise:duels').publish('invite',{from:_currentUser.name,to:targetName,key}); }catch(e){}
-  // Timeout 60s
+  try{ await _ablyChannel('duels').publish('invite',{from:_currentUser.name,to:targetName,key}); }catch(e){}
   _duelState._timeout=setTimeout(()=>{
     if(_duelState?.role==='challenger'&&_duelState?.opponent===targetName){
       _duelState=null;
@@ -4911,7 +5018,7 @@ async function sbAcceptDuel(from, key){
   document.getElementById('duel-notif-banner')?.remove();
   _duelState={role:'defender',key,opponent:from};
   try{ await storageSet(key,JSON.stringify({from,to:_currentUser.name,status:'accepted',ts:Date.now()}),true); }catch(e){}
-  try{ await _ablyChannel('frise:duels').publish('accept',{from:_currentUser.name,to:from,key}); }catch(e){}
+  try{ await _ablyChannel('duels').publish('accept',{from:_currentUser.name,to:from,key}); }catch(e){}
   startDuelGame(from);
 }
 
@@ -4920,7 +5027,7 @@ async function sbDeclineDuel(from, key){
   document.getElementById('duel-modal')?.remove();
   document.getElementById('duel-notif-banner')?.remove();
   try{ await storageSet(key,JSON.stringify({from,to:_currentUser?.name,status:'declined',ts:Date.now()}),true); }catch(e){}
-  try{ await _ablyChannel('frise:duels').publish('decline',{from:_currentUser?.name,to:from}); }catch(e){}
+  try{ await _ablyChannel('duels').publish('decline',{from:_currentUser?.name,to:from}); }catch(e){}
 }
 
 async function sbCancelDuel(){
@@ -4941,7 +5048,6 @@ async function getDuelStats(){
   const d=JSON.parse(raw.value);
   return {duelsPlayed:d.duelsPlayed||0,duelsWon:d.duelsWon||0};
 }
-
 
 // ═══════════════════════════════════════════════════════
 //  SCOREBOARD — rendu
@@ -5187,7 +5293,7 @@ function _duelFlash(side, color){
 async function startDuelGame(opponentName){
   _duelMistakes=0; _duelOpponentMistakes=0; _duelScore=0; _duelQIdx=0;
   _duelFinished=false; _duelAnswered=false; _duelOppAnswered=0;
-  _duelResultKey='frise_duel_result:'+[_currentUser.name,opponentName].sort().join(':');
+  _duelResultKey='esh_duel_result:'+[_currentUser.name,opponentName].sort().join(':');
   if(_ablyReady) try{ await storageSet(_duelResultKey,JSON.stringify({}),true); }catch(e){}
   const refs=buildWeightedQueue(ALL_REFS,300);
   _duelQueue=refs.map(ref=>buildQuizQuestion(ref,DUEL_MODES[Math.floor(Math.random()*DUEL_MODES.length)],Math.random()<.5?'forward':'reverse'));
