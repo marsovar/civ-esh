@@ -4007,7 +4007,10 @@ function _extractLogicalKeyFromLocalStorageKey(rawKey){
 }
 
 function _shouldBePresent(){
-  return !!(_ablyReady && _currentUser && !document.hidden && _tabFocused);
+  // Un joueur est considéré en ligne tant qu'il est connecté avec son compte
+  // et que la connexion Ably est active. On ne dépend plus du focus/visibility,
+  // qui est trop instable sur mobile et provoque des faux 'hors ligne'.
+  return !!(_ablyReady && _currentUser);
 }
 
 async function _syncPresence(force=false){
@@ -4221,14 +4224,29 @@ async function _presenceEnter(){
       ts:Date.now(),
       view:_currentView || 'scoreboard'
     };
+
+    // Mise à jour optimiste locale : on ne dépend pas uniquement du retour
+    // d'événement de présence pour s'afficher soi-même en ligne.
+    _presenceMembers[_currentUser.name] = data;
+    updateOnlineCount();
+
     if(_presenceJoined){
       try{ await ch.presence.update(data); }catch(e){}
       return;
     }
-    try{ await ch.presence.enter(data); _presenceJoined=true; }
-    catch(e){
-      try{ await ch.presence.update(data); _presenceJoined=true; }catch(e2){}
+
+    try{
+      await ch.presence.enter(data);
+      _presenceJoined=true;
+    }catch(e){
+      try{
+        await ch.presence.update(data);
+        _presenceJoined=true;
+      }catch(e2){}
     }
+
+    // Re-snapshot léger pour consolider l'état réel du canal.
+    _refreshPresenceSnapshot().catch(()=>{});
   }catch(e){}
 }
 async function _presenceLeave(){
@@ -4340,17 +4358,18 @@ function _handlePresenceVisibilityChange(){
     _usersCacheTs=0;
     if(_onlineHeartbeat){ clearTimeout(_onlineHeartbeat); _onlineHeartbeat=null; }
     _runPoll().then(()=>{ if(_currentUser && !_onlineHeartbeat){ const again=()=>{ _onlineHeartbeat=setTimeout(async()=>{ await _runPoll(); again(); }, _getAdaptiveInterval()); }; again(); } });
+    // À la reprise, on reconsolide la présence sans sortir le joueur du online.
+    if(_currentUser && _ablyReady) _presenceEnter();
   } else {
     sbPushMyStats();
   }
-  _syncPresence();
 }
 
 window.addEventListener('beforeunload',()=>{ _presenceDesired=false; _presenceLeave(); });
 window.addEventListener('pagehide',()=>{ _presenceDesired=false; _presenceLeave(); });
 document.addEventListener('visibilitychange',_handlePresenceVisibilityChange);
-window.addEventListener('focus',()=>{ _tabFocused=!document.hidden; sbPushMyStats(); _syncPresence(); });
-window.addEventListener('blur', ()=>{ _tabFocused=false; sbPushMyStats(); _syncPresence(); });
+window.addEventListener('focus',()=>{ _tabFocused=!document.hidden; sbPushMyStats(); if(_currentUser&&_ablyReady) _presenceEnter(); });
+window.addEventListener('blur', ()=>{ _tabFocused=false; sbPushMyStats(); });
 function sbStopHeartbeat(){
   if(_onlineHeartbeat){ clearTimeout(_onlineHeartbeat); _onlineHeartbeat=null; }
 }
