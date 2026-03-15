@@ -2633,6 +2633,7 @@ function _doUpdateUI(){
 }
 
 let _route = 'home';
+let _currentView = 'home';
 let qMode = 'concept_author', qDir = 'both', qDiff = 'all', qSize = 20;
 let qScope = 'current', qScopeRefs = ALL_REFS;
 let qCatFilter = 'all';
@@ -2646,6 +2647,7 @@ let _currentRefs = [];
 
 function go(route){
   _route = route;
+  _currentView = route;
   _filterCat = 'all'; _filterSearch = '';
   closeMobileSidebar();
 
