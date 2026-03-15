@@ -3889,13 +3889,11 @@ function loadQuizConfig(){
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  ONLINE — SYSTÈME EN LIGNE v40 (Ably refondu)
-//  Namespace Ably strictement dédié à ce site.
+//  ONLINE — NOYAU ABLY RECONSTRUIT À PARTIR DU MODÈLE INDEXMATH
 //  • Profils persistants séparés de la présence temps réel
-//  • Scoreboard global : tout compte connecté au moins une fois reste visible
-//  • Disparition du scoreboard uniquement via la déconnexion explicite
-//  • Duels autorisés uniquement contre un joueur réellement présent
-//  • Réhydratation du cache local vers Ably pour limiter la perte d'état côté client
+//  • Le scoreboard contient tous les comptes tant qu'ils ne se déconnectent pas
+//  • Les duels ne sont proposés qu'aux joueurs réellement présents
+//  • Namespace Ably dédié à ce site, distinct des autres projets
 // ══════════════════════════════════════════════════════════════════
 let _currentUser = null;
 let _sbExpanded = null;
@@ -3905,49 +3903,62 @@ let _ablyReady = false;
 let _ably = null;
 let _ablyChannels = {};
 let _kv = {};
-let _presenceMembers = {}; // name -> {name, color, ts}
+let _presenceMembers = {};
 let _usersCache = [], _usersCacheTs = 0;
 let _sbPushInProgress = false, _sbUserIndexed = false;
 let _presenceDesired = false, _presenceJoined = false;
 let _ablyInitPromise = null;
 let _ablySubscriptionsReady = false;
 let _kvBootstrapPromise = null;
+let _profilesHydrated = false;
+let _onlineReinitDone = false;
 
-const ONLINE_TTL = 15000;
 const POLL_INTERVAL_ACTIVE = 6000;
 const POLL_INTERVAL_NORMAL = 12000;
 const POLL_INTERVAL_BG = 45000;
 const USERS_CACHE_TTL_ACTIVE = 4000;
 const USERS_CACHE_TTL_NORMAL = 10000;
 const USERS_CACHE_TTL_BG = 45000;
+const LOCAL_PROFILE_CACHE_TTL = 60 * 1000;
 const USER_COLORS = ['#2a7a8f','#2d7a5f','#c0392b','#6b4fa8','#b8922a','#1a6a9a','#7a4a9f','#1a8a62','#9a6a28'];
 const ABLY_KEY = 'omrAsg.61E1oQ:sJXWtnTzOlCdLP2t44fhmBB1RyMPURSJQJLNOPwccR8';
+const LOGIN_USER_STORAGE_KEY = 'esh_eco_username_v3';
+const LOGIN_PW_STORAGE_KEY = 'esh_eco_pwhash_v3';
+const LOCAL_PROFILE_INDEX_KEY = '__esh_eco_profile_index_v3';
+const LOCAL_PROFILE_PREFIX = '__esh_eco_profile_v3_';
 
 const ONLINE_SCOPE = Object.freeze({
-  app: 'esh-scoreboard-prepa-v40',
-  clientPrefix: 'eshsb40',
-  localPrefix: '__esh_scoreboard_prepa_v40__',
+  app: 'esh-prepa-scoreboard-v3',
+  clientPrefix: 'eshscore',
+  localPrefix: '__esh_prepa_scoreboard_v3__',
   channels: {
-    kv: 'esh-scoreboard-prepa-v40:kv',
-    chat: 'esh-scoreboard-prepa-v40:chat',
-    presence: 'esh-scoreboard-prepa-v40:presence',
-    duels: 'esh-scoreboard-prepa-v40:duels'
+    kv: 'esh-prepa-scoreboard-v3:kv',
+    chat: 'esh-prepa-scoreboard-v3:chat',
+    profiles: 'esh-prepa-scoreboard-v3:profiles',
+    presence: 'esh-prepa-scoreboard-v3:presence',
+    duels: 'esh-prepa-scoreboard-v3:duels'
   },
   aliases: {
-    'frise:kv': 'esh-scoreboard-prepa-v40:kv',
-    'ecg:kv': 'esh-scoreboard-prepa-v40:kv',
-    'frise:chat': 'esh-scoreboard-prepa-v40:chat',
-    'ecg:chat': 'esh-scoreboard-prepa-v40:chat',
-    'frise:presence': 'esh-scoreboard-prepa-v40:presence',
-    'ecg:presence': 'esh-scoreboard-prepa-v40:presence',
-    'frise:duels': 'esh-scoreboard-prepa-v40:duels',
-    'ecg:duels': 'esh-scoreboard-prepa-v40:duels'
+    'frise:kv': 'esh-prepa-scoreboard-v3:kv',
+    'ecg:kv': 'esh-prepa-scoreboard-v3:kv',
+    'kv': 'esh-prepa-scoreboard-v3:kv',
+    'frise:chat': 'esh-prepa-scoreboard-v3:chat',
+    'ecg:chat': 'esh-prepa-scoreboard-v3:chat',
+    'chat': 'esh-prepa-scoreboard-v3:chat',
+    'frise:profiles': 'esh-prepa-scoreboard-v3:profiles',
+    'ecg:profiles': 'esh-prepa-scoreboard-v3:profiles',
+    'profiles': 'esh-prepa-scoreboard-v3:profiles',
+    'frise:presence': 'esh-prepa-scoreboard-v3:presence',
+    'ecg:presence': 'esh-prepa-scoreboard-v3:presence',
+    'presence': 'esh-prepa-scoreboard-v3:presence',
+    'frise:duels': 'esh-prepa-scoreboard-v3:duels',
+    'ecg:duels': 'esh-prepa-scoreboard-v3:duels',
+    'duels': 'esh-prepa-scoreboard-v3:duels'
   },
   userIndexKey: 'players:index',
-  kvPrefix: 'esh-scoreboard-prepa-v40:kv:'
+  kvPrefix: 'esh-prepa-scoreboard-v3:kv:'
 });
 
-// Tab focus
 let _tabFocused = !document.hidden && document.hasFocus();
 document.addEventListener('visibilitychange', ()=>{ _tabFocused = !document.hidden && document.hasFocus(); });
 window.addEventListener('focus', ()=>{ _tabFocused = !document.hidden; });
@@ -3956,6 +3967,194 @@ window.addEventListener('blur', ()=>{ _tabFocused = false; });
 function _safeSlug(value){
   return (value||'').toString().trim().toLowerCase().replace(/[^a-z0-9]/g,'_');
 }
+function __normName(name){
+  return String(name || '').trim().replace(/\s+/g,' ').slice(0,20);
+}
+function sbUserKey(name){ return 'players:' + _safeSlug(name); }
+function _userPresenceKey(input){
+  if(!input) return '';
+  if(typeof input === 'string') return sbUserKey(input);
+  if(input.userKey) return input.userKey;
+  if(input.key) return input.key;
+  return sbUserKey(input.name || '');
+}
+function _presencePayload(){
+  if(!_currentUser) return null;
+  return {
+    userKey: _currentUser.key,
+    name: _currentUser.name,
+    color: _currentUser.color,
+    ts: Date.now(),
+    view: _currentView || 'scoreboard',
+    visible: document.visibilityState === 'visible',
+    focused: document.hasFocus()
+  };
+}
+function _getPresenceUserKeys(){
+  return new Set(Object.keys(_presenceMembers));
+}
+function _getPresenceNames(){
+  return new Set(Object.values(_presenceMembers).map(m=>m?.name).filter(Boolean));
+}
+function isUserOnline(name){
+  return !!_presenceMembers[_userPresenceKey(name)];
+}
+function isOnline(u){ return u && isUserOnline(u.name); }
+function isOnlinePres(u){ return u && isUserOnline(u.name); }
+function _isPagePresent(){
+  return !!(_currentUser && _ablyReady && document.visibilityState === 'visible' && document.hasFocus());
+}
+function _shouldBePresent(){
+  return _isPagePresent();
+}
+async function _syncPresence(force=false){
+  return _syncPresenceFromVisibility(force);
+}
+function formatLastSeen(ts){
+  if(!ts) return 'jamais';
+  const diff=Date.now()-ts, m=Math.floor(diff/60000), h=Math.floor(diff/3600000), d=Math.floor(diff/86400000);
+  if(diff<60000) return "à l'instant";
+  if(m<60) return `il y a ${m} min`;
+  if(h<24) return `il y a ${h}h`;
+  if(d===1) return 'hier';
+  return `il y a ${d}j`;
+}
+function hexToRgb(hex){ return parseInt(hex.slice(1,3),16)+','+parseInt(hex.slice(3,5),16)+','+parseInt(hex.slice(5,7),16); }
+
+async function _hashPassword(pw){
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pw));
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('').slice(0,32);
+}
+
+function __profileLocalKey(name){
+  return LOCAL_PROFILE_PREFIX + sbUserKey(name);
+}
+function __loadProfileIndex(){
+  try{
+    const raw = localStorage.getItem(LOCAL_PROFILE_INDEX_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  }catch(e){ return []; }
+}
+function __saveProfileIndex(index){
+  try{ localStorage.setItem(LOCAL_PROFILE_INDEX_KEY, JSON.stringify(index.slice(-1000))); }catch(e){}
+}
+function __saveProfileLocal(profile){
+  if(!profile || !profile.name) return;
+  try{
+    localStorage.setItem(__profileLocalKey(profile.name), JSON.stringify(profile));
+    const idx = __loadProfileIndex();
+    if(!idx.includes(profile.name)) idx.push(profile.name);
+    __saveProfileIndex(idx);
+  }catch(e){}
+}
+function __removeProfileLocal(name){
+  try{
+    localStorage.removeItem(__profileLocalKey(name));
+    __saveProfileIndex(__loadProfileIndex().filter(n => n !== name));
+  }catch(e){}
+}
+function __loadLocalProfiles(){
+  const out = [];
+  __loadProfileIndex().forEach(name => {
+    try{
+      const raw = localStorage.getItem(__profileLocalKey(name));
+      if(!raw) return;
+      const profile = JSON.parse(raw);
+      if(profile && profile.name) out.push(profile);
+    }catch(e){}
+  });
+  return out;
+}
+function __buildEmptyScores(){
+  const scores = {total:0};
+  try{
+    Object.values(MODULES || {}).forEach(m => {
+      Object.keys(m?.parties || {}).forEach(pk => { if(scores[pk] === undefined) scores[pk] = 0; });
+    });
+  }catch(e){}
+  return scores;
+}
+function _normalizeTitleIndex(idx, score){
+  const n = Number.isInteger(idx) ? idx : parseInt(idx, 10);
+  if(!Number.isInteger(n) || n < 0) return 0;
+  const maxIdx = typeof getSbMaxUnlocked === 'function' ? getSbMaxUnlocked(score || 0) : n;
+  return Math.min(n, Math.max(0, maxIdx));
+}
+function _getStoredTitleIndex(name){
+  const p = _usersCache.find(u => u && u.name === name);
+  if(Number.isInteger(p?.titleIndex)) return p.titleIndex;
+  try{
+    const raw = localStorage.getItem('esh_eco_title_' + name);
+    if(raw !== null) return parseInt(raw, 10) || 0;
+  }catch(e){}
+  return 0;
+}
+function __mergeProfile(profile, opts){
+  opts = opts || {};
+  if(!profile || !profile.name) return null;
+  const cleanName = __normName(profile.name);
+  const fallbackColor = USER_COLORS[Math.abs(cleanName.split('').reduce((a,ch)=>a+ch.charCodeAt(0),0)) % USER_COLORS.length];
+  const defaults = __buildEmptyScores();
+  const normalized = {
+    name: cleanName,
+    color: profile.color || fallbackColor,
+    key: profile.key || sbUserKey(cleanName),
+    pwHash: profile.pwHash || '',
+    scores: Object.assign(defaults, profile.scores || {}),
+    streak: profile.streak || 0,
+    bestStreak: profile.bestStreak || 0,
+    duelsWon: profile.duelsWon || 0,
+    duelsPlayed: profile.duelsPlayed || 0,
+    lastSeen: profile.lastSeen || 0,
+    updatedAt: profile.updatedAt || profile.lastSeen || Date.now(),
+    scoreboardActive: profile.scoreboardActive !== false,
+    online: !!profile.online,
+    titleIndex: _normalizeTitleIndex(profile.titleIndex, profile.scores?.total || 0)
+  };
+
+  if(opts.persist !== false) __saveProfileLocal(normalized);
+
+  const idx = _usersCache.findIndex(u => u && u.name && u.name.toLowerCase() === normalized.name.toLowerCase());
+  if(idx >= 0){
+    const prev = _usersCache[idx];
+    const prevTs = prev ? (prev.updatedAt || prev.lastSeen || 0) : 0;
+    const nextTs = normalized.updatedAt || normalized.lastSeen || 0;
+    if(nextTs >= prevTs) _usersCache[idx] = Object.assign({}, prev, normalized);
+  }else{
+    _usersCache.push(normalized);
+  }
+  _usersCache = _usersCache.filter(u => u && u.name && u.scoreboardActive !== false);
+  _usersCache.sort((a,b)=>(b.scores?.total||0)-(a.scores?.total||0) || ((b.bestStreak||0)-(a.bestStreak||0)) || a.name.localeCompare(b.name,'fr'));
+  _usersCacheTs = Date.now();
+
+  if(_currentView === 'scoreboard' && typeof sbRenderList === 'function'){
+    const sbContent = document.getElementById('sb-content');
+    if(sbContent) sbRenderList(sbContent, _usersCache);
+  }
+  return normalized;
+}
+async function __publishProfile(profile){
+  const snapshot = Object.assign({}, profile, {
+    name: __normName(profile.name),
+    key: profile.key || sbUserKey(profile.name),
+    updatedAt: Date.now(),
+    lastSeen: Date.now()
+  });
+  snapshot.titleIndex = _normalizeTitleIndex(snapshot.titleIndex, snapshot.scores?.total || 0);
+  __mergeProfile(snapshot, {persist:true});
+  try{ await _ablyChannel('profiles').publish('profile.upsert', snapshot); }catch(e){}
+  try{ await storageSet(snapshot.key, JSON.stringify(snapshot), true); }catch(e){}
+  try{
+    const idxRaw = await storageGet(ONLINE_SCOPE.userIndexKey, true);
+    const idx = idxRaw ? JSON.parse(idxRaw.value || '{}') : {keys:[]};
+    if(!Array.isArray(idx.keys)) idx.keys = [];
+    if(!idx.keys.includes(snapshot.key)) idx.keys.push(snapshot.key);
+    await storageSet(ONLINE_SCOPE.userIndexKey, JSON.stringify(idx), true);
+  }catch(e){}
+  return snapshot;
+}
+
 function _normalizeLogicalKey(key){
   if(!key) return '';
   if(key === ONLINE_SCOPE.userIndexKey || key.startsWith('players:')) return key;
@@ -3994,11 +4193,7 @@ function _persistCriticalKv(logicalKey, value){
   try{ localStorage.setItem(_localKvKey(logicalKey), value); }catch(e){}
 }
 function _restoreCriticalKv(logicalKey){
-  try{
-    const current = localStorage.getItem(_localKvKey(logicalKey));
-    if(current!==null) return current;
-  }catch(e){}
-  return null;
+  try{ const raw = localStorage.getItem(_localKvKey(logicalKey)); return raw===null ? null : raw; }catch(e){ return null; }
 }
 function _extractLogicalKeyFromLocalStorageKey(rawKey){
   if(!rawKey) return null;
@@ -4007,129 +4202,55 @@ function _extractLogicalKeyFromLocalStorageKey(rawKey){
   return null;
 }
 
-function _collectCachedLogicalEntries(){
-  const entries = [];
-  try{
-    for(let i=0;i<localStorage.length;i++){
-      const rawKey = localStorage.key(i);
-      const logical = _extractLogicalKeyFromLocalStorageKey(rawKey);
-      if(!logical) continue;
-      const value = localStorage.getItem(rawKey);
-      if(value===null) continue;
-      entries.push({ logical, value });
-    }
-  }catch(e){}
-  return entries;
-}
-
-async function _rehydrateSharedProfilesFromLocalCache(){
-  if(!_ablyReady) return;
-  try{
-    const cached = _collectCachedLogicalEntries().filter(x=>x.logical===ONLINE_SCOPE.userIndexKey || x.logical.startsWith('players:'));
-    if(!cached.length) return;
-
-    let indexRaw = await storageGet(ONLINE_SCOPE.userIndexKey, true);
-    let indexData = indexRaw ? JSON.parse(indexRaw.value||'{}') : {keys:[]};
-    if(!Array.isArray(indexData.keys)) indexData.keys = [];
-    let indexDirty = false;
-
-    for(const entry of cached){
-      if(entry.logical === ONLINE_SCOPE.userIndexKey) continue;
-      let localProfile = null;
-      try{ localProfile = JSON.parse(entry.value); }catch(e){}
-      if(!localProfile?.name) continue;
-      localProfile.key = localProfile.key || entry.logical;
-      localProfile.scoreboardActive = localProfile.scoreboardActive !== false;
-      const shared = await storageGet(entry.logical, true).catch(()=>null);
-      let shouldPublish = !shared;
-      if(shared){
-        try{
-          const remoteProfile = JSON.parse(shared.value||'{}');
-          const localTs = Math.max(localProfile.updatedAt||0, localProfile.lastSeen||0);
-          const remoteTs = Math.max(remoteProfile.updatedAt||0, remoteProfile.lastSeen||0);
-          shouldPublish = localTs > remoteTs;
-        }catch(e){
-          shouldPublish = true;
-        }
-      }
-      if(shouldPublish) await storageSet(entry.logical, JSON.stringify(localProfile), true);
-      if(!indexData.keys.includes(entry.logical)){
-        indexData.keys.push(entry.logical);
-        indexDirty = true;
-      }
-    }
-
-    if(indexDirty) await storageSet(ONLINE_SCOPE.userIndexKey, JSON.stringify(indexData), true);
-  }catch(e){ console.warn('[Online] rehydrate local cache error:', e); }
-}
-
-function _userPresenceKey(input){
-  if(!input) return '';
-  if(typeof input === 'string') return sbUserKey(input);
-  if(input.userKey) return input.userKey;
-  if(input.key) return input.key;
-  return sbUserKey(input.name||'');
-}
-function _presencePayload(){
-  if(!_currentUser) return null;
-  return {
-    userKey: _currentUser.key,
-    name: _currentUser.name,
-    color: _currentUser.color,
-    ts: Date.now(),
-    view: _currentView || 'scoreboard'
-  };
-}
-function _getPresenceUserKeys(){
-  return new Set(Object.keys(_presenceMembers));
-}
-
-function _shouldBePresent(){
-  // Un joueur est considéré en ligne tant qu'il est connecté avec son compte
-  // et que la connexion Ably est active. On ne dépend plus du focus/visibility,
-  // qui est trop instable sur mobile et provoque des faux 'hors ligne'.
-  return !!(_ablyReady && _currentUser);
-}
-
-async function _syncPresence(force=false){
-  const should = _shouldBePresent();
-  if(!force && should===_presenceDesired) return;
-  _presenceDesired = should;
-  if(should) await _presenceEnter();
-  else await _presenceLeave();
-}
-
-function sbUserKey(name){ return 'players:' + _safeSlug(name); }
-function isOnline(u){ return u && isUserOnline(u.name); }
-function isUserOnline(name){ return !!_presenceMembers[_userPresenceKey(name)]; }
-function _getPresenceNames(){ return new Set(Object.values(_presenceMembers).map(m=>m.name).filter(Boolean)); }
-function isOnlinePres(u){ return u && isUserOnline(u.name); }
-function formatLastSeen(ts){
-  if(!ts) return 'jamais';
-  const diff=Date.now()-ts, m=Math.floor(diff/60000), h=Math.floor(diff/3600000), d=Math.floor(diff/86400000);
-  if(diff<60000) return "à l'instant";
-  if(m<60) return `il y a ${m} min`;
-  if(h<24) return `il y a ${h}h`;
-  if(d===1) return 'hier';
-  return `il y a ${d}j`;
-}
-function hexToRgb(hex){ return parseInt(hex.slice(1,3),16)+','+parseInt(hex.slice(3,5),16)+','+parseInt(hex.slice(5,7),16); }
-
-async function _hashPassword(pw){
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pw));
-  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('').slice(0,32);
-}
-
 function _resolveChannelName(name){
   if(!name) return ONLINE_SCOPE.channels.kv;
   return ONLINE_SCOPE.aliases[name] || ONLINE_SCOPE.channels[name] || `${ONLINE_SCOPE.app}:${String(name).replace(/[^a-zA-Z0-9:_-]/g,'-')}`;
 }
-
 function _ablyChannel(name){
   if(!_ably) return null;
   const resolved = _resolveChannelName(name);
-  if(!_ablyChannels[resolved]) _ablyChannels[resolved] = _ably.channels.get(resolved);
+  if(!_ablyChannels[resolved]){
+    const opts = resolved === ONLINE_SCOPE.channels.profiles ? {params:{rewind:'100'}} : {};
+    _ablyChannels[resolved] = _ably.channels.get(resolved, opts);
+  }
   return _ablyChannels[resolved];
+}
+
+async function storageSet(key,value,shared){
+  const logical = _normalizeLogicalKey(key);
+  const physical = _physicalKvKey(logical);
+  _kv[logical]=value;
+  _persistCriticalKv(logical, value);
+  if(_ablyReady) try{ await _ablyChannel('kv').publish('set',{key:physical,value}); }catch(e){}
+  return {key:logical,value};
+}
+async function storageGet(key,shared){
+  const logical = _normalizeLogicalKey(key);
+  if(_kv[logical]!==undefined) return {key:logical,value:_kv[logical]};
+  const local = _restoreCriticalKv(logical);
+  if(local!==null){ _kv[logical]=local; return {key:logical,value:local}; }
+  if(_ablyReady){
+    try{
+      const wanted = _physicalKvKey(logical);
+      let page = await _ablyChannel('kv').history({limit:1000,direction:'backwards'});
+      do{
+        for(const msg of (page?.items||[])){
+          if(msg.name==='set' && msg.data?.key===wanted){
+            _kv[logical]=msg.data.value;
+            _persistCriticalKv(logical, msg.data.value);
+            return {key:logical,value:msg.data.value};
+          }
+        }
+        if(page?.hasNext()) page = await page.next(); else break;
+      }while(page);
+    }catch(e){}
+  }
+  return null;
+}
+async function storageList(prefix,shared){
+  if(_ablyReady) await _bootstrapKvFromHistory();
+  const logicalPrefix = _normalizeLogicalKey(prefix);
+  return {keys:Object.keys(_kv).filter(k=>k.startsWith(logicalPrefix))};
 }
 
 async function _bootstrapKvFromHistory(force=false){
@@ -4150,7 +4271,7 @@ async function _bootstrapKvFromHistory(force=false){
         }
         if(page?.hasNext()) page = await page.next(); else break;
       }while(page);
-    }catch(e){ console.warn('[Online] bootstrap history error:', e); }
+    }catch(e){ console.warn('[online] kv bootstrap error:', e); }
     return _kv;
   })();
   const result = await _kvBootstrapPromise;
@@ -4158,25 +4279,99 @@ async function _bootstrapKvFromHistory(force=false){
   return result;
 }
 
-async function _refreshPresenceSnapshot(){
+async function __loadProfilesFromLegacyKV(){
+  try{
+    const idxRaw = await storageGet(ONLINE_SCOPE.userIndexKey, true);
+    let keys = [];
+    if(idxRaw){
+      const idx = JSON.parse(idxRaw.value || '{}');
+      if(Array.isArray(idx.keys)) keys = idx.keys.slice();
+    }
+    if(!keys.length) keys = Object.keys(_kv).filter(k => k.startsWith('players:'));
+    const raws = await Promise.all([...new Set(keys.filter(Boolean))].map(k => storageGet(k, true).catch(()=>null)));
+    raws.forEach(raw => {
+      if(!raw) return;
+      try{
+        const profile = JSON.parse(raw.value);
+        if(profile && profile.name) __mergeProfile(profile, {persist:true});
+      }catch(e){}
+    });
+  }catch(e){}
+}
+async function __loadProfilesFromHistory(force){
+  const now = Date.now();
+  if(_profilesHydrated && !force && _usersCache.length && (now - _usersCacheTs) < LOCAL_PROFILE_CACHE_TTL) return _usersCache;
+  __loadLocalProfiles().forEach(profile => __mergeProfile(profile, {persist:false}));
+  if(!_ablyReady) return _usersCache;
+  try{
+    let page = await _ablyChannel('profiles').history({limit:1000, direction:'backwards'});
+    const byName = new Map();
+    do{
+      for(const msg of (page?.items || [])){
+        if(msg.name !== 'profile.upsert' || !msg.data?.name) continue;
+        const profile = msg.data;
+        const key = __normName(profile.name).toLowerCase();
+        const prev = byName.get(key);
+        const nextTs = profile.updatedAt || profile.lastSeen || 0;
+        const prevTs = prev ? (prev.updatedAt || prev.lastSeen || 0) : -1;
+        if(!prev || nextTs >= prevTs) byName.set(key, profile);
+      }
+      if(page?.hasNext()) page = await page.next(); else break;
+    }while(page);
+    Array.from(byName.values()).forEach(profile => __mergeProfile(profile, {persist:true}));
+    _profilesHydrated = true;
+  }catch(e){
+    console.warn('[online] profile history load error:', e);
+  }
+  await __loadProfilesFromLegacyKV();
+  return _usersCache;
+}
+async function _fetchAllUsers(force=false){
+  await __loadProfilesFromHistory(!!force);
+  if(_currentUser?.name){
+    const me = _usersCache.find(u => u && u.name === _currentUser.name);
+    if(me && me.scoreboardActive !== false) __mergeProfile(me, {persist:false});
+  }
+  return _usersCache;
+}
+
+async function __syncPresenceMembers(){
   if(!_ablyReady) return;
   try{
     const members = await _ablyChannel('presence').presence.get();
     const next = {};
-    (members||[]).forEach(member=>{
+    (members || []).forEach(member => {
       const data = member?.data;
       const key = _userPresenceKey(data);
-      if(data?.name && key) next[key] = Object.assign({}, data, { userKey: key });
+      if(data?.name && key) next[key] = Object.assign({}, data, {userKey:key});
     });
-    if(_currentUser && _presenceDesired && _ablyReady){
-      const selfKey = _userPresenceKey(_currentUser);
-      if(selfKey && !next[selfKey]){
-        const optimistic = _presencePayload();
-        if(optimistic) next[selfKey] = optimistic;
-      }
-    }
     _presenceMembers = next;
     updateOnlineCount();
+  }catch(e){
+    console.warn('[online] presence sync error:', e);
+  }
+}
+async function _refreshPresenceSnapshot(){
+  return __syncPresenceMembers();
+}
+
+function _onPresenceEvent(member){
+  const data = member?.data;
+  if(!data?.name) return;
+  const key = _userPresenceKey(data);
+  if(!key) return;
+  if(member.action === 'leave' || member.action === 'absent') delete _presenceMembers[key];
+  else _presenceMembers[key] = Object.assign({}, data, {userKey:key});
+  updateOnlineCount();
+  if(_currentView === 'scoreboard' && typeof sbRenderList === 'function'){
+    const sbContent = document.getElementById('sb-content');
+    if(sbContent) sbRenderList(sbContent, _usersCache);
+  }
+}
+function _onAblyUserUpdate(value){
+  try{
+    const u = JSON.parse(value);
+    if(u?.name) __mergeProfile(u, {persist:true});
   }catch(e){}
 }
 
@@ -4185,6 +4380,7 @@ async function _subscribeRealtimeChannels(){
   _ablySubscriptionsReady = true;
 
   const kvCh = _ablyChannel('kv');
+  kvCh.unsubscribe();
   kvCh.subscribe('set', msg=>{
     const logical = _logicalKvKey(msg.data?.key);
     if(!logical) return;
@@ -4195,55 +4391,75 @@ async function _subscribeRealtimeChannels(){
   });
 
   const chatCh = _ablyChannel('chat');
+  chatCh.unsubscribe();
   chatCh.subscribe('msg', msg=>{
     const m=msg.data;
     if(!m||!m.ts||!m.author) return;
     const now=Date.now();
     const exists=_chatMsgs.some(x=>x.ts===m.ts&&x.author===m.author);
-    if(!exists){
-      _chatMsgs.push(m);
-      _chatMsgs=_chatMsgs.filter(x=>(now-x.ts)<CHAT_TTL).slice(-CHAT_MAX);
-      _chatMsgs.sort((a,b)=>a.ts-b.ts);
-      if(_chatOpen){ chatRenderMessages(); _chatMarkRead(); }
-      else{
-        const me=_currentUser?.name;
-        if(m.author!==me&&m.ts>_chatLastSeen){ _chatUnread++; _chatRefreshBadge(); }
-      }
+    if(exists) return;
+    _chatMsgs.push(m);
+    _chatMsgs=_chatMsgs.filter(x=>(now-x.ts)<CHAT_TTL).slice(-CHAT_MAX);
+    _chatMsgs.sort((a,b)=>a.ts-b.ts);
+    if(_chatOpen){ chatRenderMessages(); _chatMarkRead(); }
+    else if(m.author!==_currentUser?.name && m.ts>_chatLastSeen){
+      _chatUnread++;
+      _chatRefreshBadge();
     }
   });
   setTimeout(()=>_loadChatHistory(),500);
 
   const presenceCh = _ablyChannel('presence');
-  presenceCh.presence.subscribe(member=>_onPresenceEvent(member));
+  try{ presenceCh.presence.unsubscribe(); }catch(e){}
+  ['enter','update','leave','present','absent'].forEach(evt => presenceCh.presence.subscribe(evt, _onPresenceEvent));
+
+  const profileCh = _ablyChannel('profiles');
+  profileCh.unsubscribe();
+  profileCh.subscribe('profile.upsert', msg=>{
+    if(msg?.data?.name) __mergeProfile(msg.data, {persist:true});
+  });
 
   const duelCh = _ablyChannel('duels');
+  duelCh.unsubscribe();
   duelCh.subscribe('invite', msg=>{
-    if(!_currentUser) return;
-    const inv=msg.data;
-    if(inv?.to===_currentUser.name && !_duelState) _showDuelNotifBanner(inv.from, inv.key);
+    const data = msg.data || {};
+    if(!_currentUser || data.to !== _currentUser.name) return;
+    if(_duelState) return;
+    if(data.from && !isUserOnline(data.from)) return;
+    sbShowDuelIncoming(data.from, data.key || data.roomId || '');
   });
   duelCh.subscribe('accept', msg=>{
+    const data = msg.data || {};
     if(!_currentUser) return;
-    const acc=msg.data;
-    if(acc?.to===_currentUser.name && _duelState?.role==='challenger'){
-      clearTimeout(_duelState._timeout);
+    if(data.to===_currentUser.name && _duelState?.role==='challenger'){
+      try{ clearTimeout(_duelState._timeout); }catch(e){}
       document.getElementById('duel-modal')?.remove();
-      startDuelGame(acc.from);
+      startDuelGame(data.from);
     }
   });
   duelCh.subscribe('decline', msg=>{
-    if(!_currentUser) return;
     const data = msg.data || {};
+    if(!_currentUser) return;
     if(data.to===_currentUser.name && _duelState?.role==='challenger'){
-      clearTimeout(_duelState._timeout);
+      try{ clearTimeout(_duelState._timeout); }catch(e){}
       _duelState=null;
       document.getElementById('duel-modal')?.remove();
-      _showToast(data.from+' a refusé le duel.', 'var(--red)');
+      _showToast((data.from||'Cet utilisateur') + ' a refusé le duel.', 'var(--red)');
+    }
+  });
+  duelCh.subscribe('cancel', msg=>{
+    const data = msg.data || {};
+    if(!_currentUser) return;
+    if(data.to===_currentUser.name) document.getElementById('duel-notif-banner')?.remove();
+    if(data.to===_currentUser.name && _duelState?.role==='challenger'){
+      _duelState = null;
+      document.getElementById('duel-modal')?.remove();
     }
   });
   duelCh.subscribe('result', msg=>{
     if(!_currentUser||!_duelState) return;
-    if(msg.data?.player!==_currentUser.name) _onOpponentDuelResult(msg.data);
+    const data = msg.data || {};
+    if(data.player!==_currentUser.name) _onOpponentDuelResult(data);
   });
 }
 
@@ -4262,12 +4478,11 @@ async function ablyInit(){
     s.src='https://cdn.ably.com/lib/ably.min-2.js';
     s.dataset.ablyLoader = '1';
     s.onload=boot;
-    s.onerror=()=>{ console.warn('Ably load failed'); resolve(); };
+    s.onerror=()=>{ console.warn('[Ably] load failed'); resolve(); };
     document.head.appendChild(s);
   });
   return _ablyInitPromise;
 }
-
 function _setupAbly(resolve){
   try{
     if(_ably){ resolve(); return; }
@@ -4279,200 +4494,80 @@ function _setupAbly(resolve){
     let resolved = false;
     const done = ()=>{ if(!resolved){ resolved = true; resolve(); } };
 
-    _ably.connection.on(async stateChange=>{
-      const state = stateChange?.current || stateChange;
-      if(state === 'connected'){
-        _ablyReady = true;
-        await _subscribeRealtimeChannels();
-        await _bootstrapKvFromHistory();
-        await _rehydrateSharedProfilesFromLocalCache();
-        await _bootstrapKvFromHistory(true);
-        await _refreshPresenceSnapshot();
-        await _syncPresence(true);
-        if(_currentView==='scoreboard') _fetchAllUsers(true);
-        done();
-      }else if(state === 'failed'){
-        _ablyReady = false;
-        _presenceJoined = false;
-        _presenceMembers = {};
-        updateOnlineCount();
-        console.warn('Ably failed');
-        done();
-      }else if(['disconnected','suspended','closing','closed'].includes(state)){
-        _ablyReady = false;
-        _presenceJoined = false;
-        _presenceMembers = {};
-        updateOnlineCount();
+    _ably.connection.on('connected', async ()=>{
+      _ablyReady = true;
+      await _subscribeRealtimeChannels();
+      await _bootstrapKvFromHistory(true);
+      await __syncPresenceMembers();
+      await __loadProfilesFromHistory(true);
+      if(_currentUser){
+        await _syncPresenceFromVisibility(true);
+        await sbPushMyStats();
       }
+      if(_currentView==='scoreboard') _fetchAllUsers(true);
+      done();
     });
-  }catch(e){ console.warn('Ably setup error:',e); resolve(); }
+    _ably.connection.on('disconnected', ()=>{ _ablyReady = false; _presenceJoined=false; });
+    _ably.connection.on('suspended', ()=>{ _ablyReady = false; _presenceJoined=false; });
+    _ably.connection.on('failed', ()=>{ _ablyReady = false; _presenceJoined=false; console.warn('[Ably] connection failed'); done(); });
+  }catch(e){ console.warn('[Ably] setup error:', e); resolve(); }
 }
 
 async function _presenceEnter(){
-  if(!_ablyReady||!_currentUser) return;
+  if(!_ablyReady || !_currentUser || !_isPagePresent()) return;
   try{
-    const ch=_ablyChannel('presence');
-    const data=_presencePayload();
-    if(!data) return;
-
-    // Mise à jour optimiste locale : on ne dépend pas uniquement du retour
-    // d'événement de présence pour s'afficher soi-même en ligne.
-    _presenceMembers[data.userKey] = data;
-    updateOnlineCount();
-
-    if(_presenceJoined){
-      try{ await ch.presence.update(data); }catch(e){}
-      return;
-    }
-
+    const payload = _presencePayload();
+    if(!payload) return;
     try{
-      await ch.presence.enter(data);
-      _presenceJoined=true;
+      await _ablyChannel('presence').presence.enter(payload);
+      _presenceJoined = true;
     }catch(e){
       try{
-        await ch.presence.update(data);
-        _presenceJoined=true;
+        await _ablyChannel('presence').presence.update(payload);
+        _presenceJoined = true;
       }catch(e2){}
     }
-
-    // Re-snapshot léger pour consolider l'état réel du canal.
-    _refreshPresenceSnapshot().catch(()=>{});
+    _presenceMembers[payload.userKey] = payload;
+    updateOnlineCount();
   }catch(e){}
 }
 async function _presenceLeave(){
-  if(!_ablyReady){ _presenceJoined=false; return; }
-  if(!_presenceJoined && !_currentUser) return;
+  if(!_ablyReady){ _presenceJoined = false; return; }
   try{ await _ablyChannel('presence').presence.leave(); }catch(e){}
-  _presenceJoined=false;
+  _presenceJoined = false;
   if(_currentUser) delete _presenceMembers[_userPresenceKey(_currentUser)];
   updateOnlineCount();
 }
-
-function _onPresenceEvent(member){
-  if(!member?.data?.name) return;
-  const key = _userPresenceKey(member.data);
-  if(!key) return;
-  if(member.action==='leave'||member.action==='absent') delete _presenceMembers[key];
-  else _presenceMembers[key]=Object.assign({}, member.data, { userKey: key });
-  updateOnlineCount();
-  if(_currentView==='scoreboard'){
-    const sbContent=document.getElementById('sb-content');
-    if(sbContent) sbRenderList(sbContent,_usersCache);
-  }
+async function _syncPresenceFromVisibility(force=false){
+  const should = _isPagePresent();
+  if(!force && should === _presenceDesired) return;
+  _presenceDesired = should;
+  if(should) await _presenceEnter();
+  else await _presenceLeave();
+}
+async function _touchPresence(){
+  if(!_ablyReady || !_currentUser || !_presenceJoined || !_isPagePresent()) return;
+  try{ await _ablyChannel('presence').presence.update(_presencePayload()); }catch(e){}
 }
 
-function _onAblyUserUpdate(value){
-  try{
-    const u=JSON.parse(value);
-    if(!u?.name) return;
-    u.key = u.key || sbUserKey(u.name);
-    const isActive = u.scoreboardActive !== false;
-    const idx=_usersCache.findIndex(x=>(x.key||sbUserKey(x.name))===u.key);
-    if(isActive){
-      if(idx>=0) _usersCache[idx]=u; else _usersCache.push(u);
-    }else if(idx>=0){
-      _usersCache.splice(idx,1);
-    }
-    _usersCache.sort((a,b)=>{
-      const scoreDiff = (b.scores?.total||0)-(a.scores?.total||0);
-      if(scoreDiff) return scoreDiff;
-      const duelDiff = (b.duelsWon||0)-(a.duelsWon||0);
-      if(duelDiff) return duelDiff;
-      return Math.max(b.updatedAt||0,b.lastSeen||0)-Math.max(a.updatedAt||0,a.lastSeen||0);
-    });
-    _usersCacheTs=Date.now();
-    const sbContent=document.getElementById('sb-content');
-    if(sbContent && _currentView==='scoreboard') sbRenderList(sbContent,_usersCache);
-  }catch(e){}
-}
-
-// ── Storage wrappers ────────────────────────────────────────────
-async function storageSet(key,value,shared){
-  const logical = _normalizeLogicalKey(key);
-  const physical = _physicalKvKey(logical);
-  _kv[logical]=value;
-  _persistCriticalKv(logical, value);
-  if(_ablyReady) try{ await _ablyChannel('kv').publish('set',{key:physical,value}); }catch(e){}
-  return {key:logical,value};
-}
-async function storageGet(key,shared){
-  const logical = _normalizeLogicalKey(key);
-  if(_kv[logical]!==undefined) return {key:logical,value:_kv[logical]};
-
-  const local = _restoreCriticalKv(logical);
-  if(local!==null){ _kv[logical]=local; return {key:logical,value:local}; }
-
-  if(_ablyReady){
-    try{
-      const wanted = _physicalKvKey(logical);
-      let page=await _ablyChannel('kv').history({limit:1000,direction:'backwards'});
-      do{
-        for(const msg of (page?.items||[])){
-          if(msg.name==='set' && msg.data?.key===wanted){
-            _kv[logical]=msg.data.value;
-            _persistCriticalKv(logical, msg.data.value);
-            return {key:logical,value:msg.data.value};
-          }
-        }
-        if(page?.hasNext()) page=await page.next(); else break;
-      }while(page);
-    }catch(e){}
-  }
-  return null;
-}
-async function storageList(prefix,shared){
-  if(_ablyReady) await _bootstrapKvFromHistory();
-  const logicalPrefix = _normalizeLogicalKey(prefix);
-  return {keys:Object.keys(_kv).filter(k=>k.startsWith(logicalPrefix))};
-}
-
-// ── Heartbeat ───────────────────────────────────────────────────
 function _getAdaptiveInterval(){
   if(document.hidden) return POLL_INTERVAL_BG;
   if(_chatOpen) return POLL_INTERVAL_ACTIVE;
   if(document.getElementById('sb-content')?.children.length>0) return POLL_INTERVAL_ACTIVE;
   return POLL_INTERVAL_NORMAL;
 }
-
-async function _touchPresence(){
-  if(!_ablyReady || !_currentUser || !_presenceJoined) return;
-  try{ await _ablyChannel('presence').presence.update(_presencePayload()); }catch(e){}
-}
-
 function sbStartHeartbeat(){
   if(_onlineHeartbeat) clearTimeout(_onlineHeartbeat);
   _runPoll();
-  _syncPresence(true);
-  function _schedule(){
-    _onlineHeartbeat=setTimeout(async()=>{ await _runPoll(); _schedule(); }, _getAdaptiveInterval());
+  _syncPresenceFromVisibility(true);
+  function again(){
+    _onlineHeartbeat=setTimeout(async()=>{ await _runPoll(); again(); }, _getAdaptiveInterval());
   }
-  _schedule();
+  again();
 }
-
-function _handlePresenceVisibilityChange(){
-  _tabFocused=!document.hidden && document.hasFocus();
-  if(!document.hidden){
-    _usersCacheTs=0;
-    if(_onlineHeartbeat){ clearTimeout(_onlineHeartbeat); _onlineHeartbeat=null; }
-    _runPoll().then(()=>{ if(_currentUser && !_onlineHeartbeat){ const again=()=>{ _onlineHeartbeat=setTimeout(async()=>{ await _runPoll(); again(); }, _getAdaptiveInterval()); }; again(); } });
-    // À la reprise, on reconsolide la présence sans sortir le joueur du online.
-    if(_currentUser && _ablyReady) _presenceEnter();
-  } else {
-    sbPushMyStats();
-  }
-}
-
-window.addEventListener('beforeunload',()=>{ _presenceDesired=false; _presenceLeave(); });
-window.addEventListener('pagehide',()=>{ _presenceDesired=false; _presenceLeave(); });
-document.addEventListener('visibilitychange',_handlePresenceVisibilityChange);
-window.addEventListener('focus',()=>{ _tabFocused=!document.hidden; sbPushMyStats(); if(_currentUser&&_ablyReady) _presenceEnter(); });
-window.addEventListener('blur', ()=>{ _tabFocused=false; sbPushMyStats(); });
-window.addEventListener('online', ()=>{ if(_currentUser){ _usersCacheTs=0; if(_ablyReady) _syncPresence(true); } });
-window.addEventListener('offline', ()=>{ _presenceJoined=false; _presenceMembers={}; updateOnlineCount(); });
 function sbStopHeartbeat(){
   if(_onlineHeartbeat){ clearTimeout(_onlineHeartbeat); _onlineHeartbeat=null; }
 }
-
 let _pollRunning=false;
 async function _runPoll(){
   if(_pollRunning) return;
@@ -4481,119 +4576,101 @@ async function _runPoll(){
     if(_currentUser&&_ablyReady){
       await sbPushMyStats();
       await _touchPresence();
-      if(!_presenceJoined) await _syncPresence(true);
+      await _syncPresenceFromVisibility(true);
     }
   }catch(e){}finally{ _pollRunning=false; }
 }
-
-async function _fetchAllUsers(force=false){
-  if(!_ablyReady) return _usersCache;
-  const now=Date.now();
-  const ttl=document.hidden?USERS_CACHE_TTL_BG:_chatOpen?USERS_CACHE_TTL_ACTIVE:USERS_CACHE_TTL_NORMAL;
-  if(!force&&_usersCache.length&&(now-_usersCacheTs)<ttl) return _usersCache;
-  try{
-    const idxRaw=await storageGet(ONLINE_SCOPE.userIndexKey,true);
-    let keys=[];
-    if(idxRaw){
-      const idx=JSON.parse(idxRaw.value||'{}');
-      if(Array.isArray(idx.keys)) keys = idx.keys.slice();
-    }
-    if(!keys.length){
-      keys = Object.keys(_kv).filter(k=>k.startsWith('players:'));
-    }
-    const cachedProfileKeys = _collectCachedLogicalEntries().map(x=>x.logical).filter(k=>k.startsWith('players:'));
-    const uniqKeys = [...new Set(keys.filter(Boolean).concat(cachedProfileKeys))];
-    const raws=await Promise.all(uniqKeys.map(k=>storageGet(k,true).catch(()=>null)));
-    const usersByKey=new Map();
-    raws.forEach(raw=>{
-      if(raw) try{
-        const u=JSON.parse(raw.value);
-        if(u && u.scoreboardActive !== false){
-          u.key = u.key || sbUserKey(u.name);
-          const prev = usersByKey.get(u.key);
-          const prevTs = prev ? Math.max(prev.updatedAt||0, prev.lastSeen||0) : -1;
-          const nextTs = Math.max(u.updatedAt||0, u.lastSeen||0);
-          if(!prev || nextTs >= prevTs) usersByKey.set(u.key, u);
-        }
-      }catch(e){}
-    });
-    _usersCache=[...usersByKey.values()].sort((a,b)=>{
-      const scoreDiff=(b.scores?.total||0)-(a.scores?.total||0);
-      if(scoreDiff) return scoreDiff;
-      const duelDiff=(b.duelsWon||0)-(a.duelsWon||0);
-      if(duelDiff) return duelDiff;
-      return Math.max(b.updatedAt||0,b.lastSeen||0)-Math.max(a.updatedAt||0,a.lastSeen||0);
-    });
-    _usersCacheTs=now;
-    const sbContent=document.getElementById('sb-content');
-    if(sbContent && _currentView==='scoreboard') sbRenderList(sbContent,_usersCache);
-  }catch(e){}
-  return _usersCache;
+function _handlePresenceVisibilityChange(){
+  _tabFocused=!document.hidden && document.hasFocus();
+  if(!document.hidden){
+    _usersCacheTs=0;
+    if(_onlineHeartbeat){ clearTimeout(_onlineHeartbeat); _onlineHeartbeat=null; }
+    _runPoll().then(()=>{ if(_currentUser && !_onlineHeartbeat){ const again=()=>{ _onlineHeartbeat=setTimeout(async()=>{ await _runPoll(); again(); }, _getAdaptiveInterval()); }; again(); } });
+    if(_currentUser && _ablyReady) _syncPresenceFromVisibility(true);
+  } else if(_currentUser){
+    sbPushMyStats();
+    _syncPresenceFromVisibility(true);
+  }
 }
+window.addEventListener('beforeunload',()=>{ _presenceDesired=false; _presenceLeave(); });
+window.addEventListener('pagehide',()=>{ _presenceDesired=false; _presenceLeave(); });
+document.addEventListener('visibilitychange',_handlePresenceVisibilityChange);
+window.addEventListener('focus',()=>{ _tabFocused=!document.hidden; if(_currentUser){ sbPushMyStats(); _syncPresenceFromVisibility(true); } });
+window.addEventListener('blur', ()=>{ _tabFocused=false; if(_currentUser){ sbPushMyStats(); _syncPresenceFromVisibility(true); } });
+window.addEventListener('online', ()=>{ if(_currentUser){ _usersCacheTs=0; if(_ablyReady) _syncPresenceFromVisibility(true); } });
+window.addEventListener('offline', ()=>{ _presenceJoined=false; _presenceMembers={}; updateOnlineCount(); });
 
 async function sbPushMyStats(extra={}){
-  if(!_currentUser||!_ablyReady) return;
-  if(_sbPushInProgress) return;
-  _sbPushInProgress=true;
+  if(!_currentUser || !_ablyReady || _sbPushInProgress) return;
+  _sbPushInProgress = true;
   try{
-    const scores={total:Math.round(mastHybridPct(ALL_REFS)*10)/10};
+    const current = _usersCache.find(u => u && u.name === _currentUser.name);
+    const scores = {total:Math.round(mastHybridPct(ALL_REFS)*10)/10};
     Object.entries(MODULES).forEach(([mk,m])=>
       Object.entries(m.parties).forEach(([pk,p])=>{ scores[pk]=Math.round(mastHybridPct(p.refs)*10)/10; })
     );
-    const prev=await storageGet(_currentUser.key,true);
-    const prevData=prev?JSON.parse(prev.value):{};
-    const userData=Object.assign({},prevData,{
-      key:_currentUser.key,
-      name:_currentUser.name,
-      color:_currentUser.color,
-      pwHash:_currentUser.pwHash||prevData.pwHash||'',
-      lastSeen:Date.now(),
-      updatedAt: Date.now(),
-      online:_shouldBePresent(),
-      scoreboardActive:true,
+    const prevLegacy = await storageGet(_currentUser.key, true).catch(()=>null);
+    let legacyData = {};
+    try{ if(prevLegacy?.value) legacyData = JSON.parse(prevLegacy.value); }catch(e){}
+    const base = current || legacyData || {};
+    const localTitle = _getStoredTitleIndex(_currentUser.name);
+    const chosenTitle = Number.isInteger(extra.titleIndex)
+      ? extra.titleIndex
+      : (Number.isInteger(_sbTitleChoice[_currentUser.name]) ? _sbTitleChoice[_currentUser.name]
+         : (Number.isInteger(base.titleIndex) ? base.titleIndex : localTitle));
+    const profile = {
+      name: _currentUser.name,
+      color: _currentUser.color,
+      key: _currentUser.key,
+      pwHash: _currentUser.pwHash || base.pwHash || '',
+      scoreboardActive: true,
+      online: _isPagePresent(),
       scores,
-      streak:getStreak(),
-      bestStreak:Math.max(_getStoredBestStreak(),prevData.bestStreak||0),
-      duelsWon:Math.max(prevData.duelsWon||0,extra.duelsWon||0),
-      duelsPlayed:Math.max(prevData.duelsPlayed||0,extra.duelsPlayed||0),
-      titleIndex: Number.isInteger(extra.titleIndex) ? extra.titleIndex : (Number.isInteger(prevData.titleIndex) ? prevData.titleIndex : 0),
-    },extra);
-    await storageSet(_currentUser.key,JSON.stringify(userData),true);
-
-    const idxRaw=await storageGet(ONLINE_SCOPE.userIndexKey,true);
-    const idx=idxRaw?JSON.parse(idxRaw.value):{keys:[]};
-    if(!Array.isArray(idx.keys)) idx.keys=[];
-    if(!idx.keys.includes(_currentUser.key)) idx.keys.push(_currentUser.key);
-    await storageSet(ONLINE_SCOPE.userIndexKey,JSON.stringify(idx),true);
-    _sbUserIndexed=true;
-  }catch(e){}finally{ _sbPushInProgress=false; }
+      streak: getStreak(),
+      bestStreak: Math.max(_getStoredBestStreak(), base.bestStreak || 0),
+      duelsWon: extra.duelsWon !== undefined ? extra.duelsWon : (base.duelsWon || 0),
+      duelsPlayed: extra.duelsPlayed !== undefined ? extra.duelsPlayed : (base.duelsPlayed || 0),
+      titleIndex: _normalizeTitleIndex(chosenTitle, scores.total),
+      lastSeen: Date.now(),
+      updatedAt: Date.now()
+    };
+    await __publishProfile(profile);
+    _sbUserIndexed = true;
+  }catch(e){
+    console.warn('[online] sbPushMyStats error:', e);
+  }finally{
+    _sbPushInProgress = false;
+  }
 }
-
 async function sbSetOffline(){
-  if(!_currentUser||!_ablyReady) return;
+  if(!_currentUser || !_ablyReady) return;
   try{
-    const prev=await storageGet(_currentUser.key,true);
-    if(!prev) return;
-    const d=JSON.parse(prev.value);
-    d.online=false;
-    d.lastSeen=Date.now();
-    d.updatedAt=Date.now();
-    d.scoreboardActive = d.scoreboardActive !== false;
-    await storageSet(_currentUser.key,JSON.stringify(d),true);
+    const existing = _usersCache.find(u => u && u.name === _currentUser.name) || {};
+    const hidden = Object.assign({}, existing, {
+      key: _currentUser.key,
+      name: _currentUser.name,
+      color: _currentUser.color,
+      pwHash: _currentUser.pwHash || existing.pwHash || '',
+      online: false,
+      lastSeen: Date.now(),
+      updatedAt: Date.now(),
+      scoreboardActive: true,
+      titleIndex: _normalizeTitleIndex(existing.titleIndex, existing.scores?.total || 0)
+    });
+    await __publishProfile(hidden);
   }catch(e){}
 }
-
 async function sbLoadAll(){ return _fetchAllUsers(false); }
 async function sbRefresh(){
   if(_currentUser) await sbPushMyStats();
-  _fetchAllUsers(true).then(users=>{ const el=document.getElementById('sb-content'); if(el) sbRenderList(el,users); });
+  const users = await _fetchAllUsers(true);
+  const el=document.getElementById('sb-content');
+  if(el && typeof sbRenderList === 'function') sbRenderList(el,users);
 }
 
-// ── Compteur en ligne (Ably Presence natif) ─────────────────────
 function updateOnlineCount(){
   const members = Object.values(_presenceMembers).filter(Boolean);
   const n = members.length;
-
   const el = document.getElementById('tp-online-n');
   if(el) el.textContent = n>0 ? n : '—';
   const dot = document.getElementById('tp-online-dot');
@@ -4602,7 +4679,6 @@ function updateOnlineCount(){
     dot.style.opacity = n>0 ? '1' : '0.35';
     dot.style.animation = n>0 ? 'pulse-online 2s ease-in-out infinite' : 'none';
   }
-
   const avatarsEl = document.getElementById('tp-online-avatars');
   if(avatarsEl){
     avatarsEl.innerHTML = n===0
@@ -4610,34 +4686,15 @@ function updateOnlineCount(){
       : members.slice(0,8).map(u=>`<div style="display:flex;align-items:center;gap:7px;margin-bottom:3px"><div style="width:16px;height:16px;border-radius:50%;background:${u.color||'var(--navy)'};display:flex;align-items:center;justify-content:center;font-family:DM Mono,monospace;font-size:7px;font-weight:700;color:#fff">${(u.name||'?')[0].toUpperCase()}</div><span style="font-family:DM Mono,monospace;font-size:9px;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:90px">${u.name}</span><span style="width:6px;height:6px;background:#2ecc71;border-radius:50%;margin-left:auto;box-shadow:0 0 4px #2ecc71"></span></div>`).join('')
         + (n>8?`<div style="font-family:DM Mono,monospace;font-size:8px;color:var(--t4);margin-top:2px">+${n-8} autres</div>`:'');
   }
-
   const sbEl = document.getElementById('sb-online-count');
   if(sbEl) sbEl.textContent = n>0 ? n+' utilisateur'+(n>1?'s':'')+' en ligne' : 'Aucun utilisateur en ligne';
-
   const sbFoot = document.getElementById('sb-online-foot');
   if(sbFoot){ sbFoot.textContent = n>0 ? n+' en ligne' : 'hors ligne'; sbFoot.style.color = n>0 ? '#2ecc71' : 'var(--t4)'; }
-
   const pill = document.getElementById('chat-online-pill');
   if(pill){ pill.textContent = n>0 ? n+' en ligne' : 'hors ligne'; pill.style.color = n>0 ? '#2ecc71' : 'var(--t4)'; }
-
   _chatRefreshBadge();
-
-  const presenceNames = _getPresenceNames();
-  const sbContent = document.querySelector('#sb-content .sb-user-list, #sb-content > div');
-  if(sbContent){
-    _usersCache.forEach(u=>{
-      const dot2 = document.querySelector(`[data-sb-dot="${u.name}"]`);
-      if(dot2){
-        const on = presenceNames.has(u.name);
-        dot2.style.background = on ? '#2ecc71' : 'var(--s3)';
-        dot2.style.boxShadow = on ? '0 0 3px rgba(46,204,113,.45)' : 'none';
-        dot2.title = on ? 'En ligne' : 'Hors ligne';
-      }
-    });
-  }
 }
 
-// ── UI ───────────────────────────────────────────────────────────
 function updateSbUI(){
   const el=document.getElementById('tp-user');
   if(el){
@@ -4655,73 +4712,81 @@ function updateSbUI(){
   }
 }
 
-// ── Login / Logout ───────────────────────────────────────────────
 async function sbLogin(name, password=''){
-  if(!name?.trim()) return false;
-  name=name.trim().slice(0,20);
-  const key=sbUserKey(name);
+  name = __normName(name);
+  password = password || '';
+  if(!name) return false;
   let pwHash='';
-  if(password) pwHash=password.startsWith('__hash__')?password.slice(8):await _hashPassword(password);
+  if(password) pwHash=password.startsWith('__hash__') ? password.slice(8) : await _hashPassword(password);
 
-  let color, existingPwHash='', existingData={};
-  try{
-    const res=await storageGet(key,true);
-    if(res){ existingData=JSON.parse(res.value); color=existingData.color; existingPwHash=existingData.pwHash||''; }
-  }catch(e){}
-  if(existingPwHash&&pwHash!==existingPwHash){ _showLoginError('Mot de passe incorrect.'); return false; }
-  if(!color){ const idx=Math.abs(name.split('').reduce((a,ch)=>a+ch.charCodeAt(0),0))%USER_COLORS.length; color=USER_COLORS[idx]; }
+  await _fetchAllUsers(true);
+  let existing = _usersCache.find(u => u.name.toLowerCase() === name.toLowerCase()) || null;
+  if(!existing){
+    try{
+      const legacy = await storageGet(sbUserKey(name), true);
+      if(legacy?.value) existing = JSON.parse(legacy.value);
+    }catch(e){}
+  }
+  if(existing?.pwHash && pwHash !== existing.pwHash){ _showLoginError('Mot de passe incorrect.'); return false; }
 
-  const canonicalName = existingData.name || name;
-  _currentUser={name:canonicalName,color,key,pwHash};
-  localStorage.setItem('prepa_username',name);
-  if(pwHash) localStorage.setItem('prepa_pwhash',pwHash);
-  else localStorage.removeItem('prepa_pwhash');
+  const color = existing?.color || USER_COLORS[Math.abs(name.split('').reduce((a,ch)=>a+ch.charCodeAt(0),0)) % USER_COLORS.length];
+  const canonicalName = existing?.name || name;
+  _currentUser = {name: canonicalName, color, key: sbUserKey(canonicalName), pwHash: pwHash || existing?.pwHash || ''};
+  localStorage.setItem(LOGIN_USER_STORAGE_KEY, canonicalName);
+  if(_currentUser.pwHash) localStorage.setItem(LOGIN_PW_STORAGE_KEY, _currentUser.pwHash);
+  else localStorage.removeItem(LOGIN_PW_STORAGE_KEY);
 
-  _sbUserIndexed=false;
-  _presenceDesired=false;
-  _presenceJoined=false;
-  sbStartHeartbeat();
+  if(existing && Number.isInteger(existing.titleIndex)) _sbTitleChoice[canonicalName] = existing.titleIndex;
+
   updateSbUI();
   chatRenderFooter();
   document.getElementById('sb-login-modal')?.remove();
-  Promise.all([sbPushMyStats({scoreboardActive:true}), _syncPresence(true)]).then(()=>_fetchAllUsers(true)).catch(()=>{});
+  if(_currentView === 'scoreboard') go('scoreboard');
+  await _syncPresenceFromVisibility(true);
+  await sbPushMyStats({scoreboardActive:true});
+  sbStartHeartbeat();
+  _loadChatHistory();
   return true;
 }
-
 function _showLoginError(msg){
   const err=document.getElementById('sb-login-error');
   if(err){ err.textContent=msg; err.style.display='block'; }
 }
-
 async function sbLogout(){
-  const leavingUser=_currentUser;
-  if(leavingUser){
-    _presenceDesired=false;
+  const prevUser = _currentUser ? Object.assign({}, _currentUser) : null;
+  if(prevUser){
     await _presenceLeave();
-    try{
-      const prev=await storageGet(leavingUser.key,true);
-      const prevData=prev?JSON.parse(prev.value):{};
-      const nextData=Object.assign({},prevData,{
-        key:leavingUser.key,
-        name:leavingUser.name,
-        color:leavingUser.color,
-        pwHash:leavingUser.pwHash||prevData.pwHash||'',
-        online:false,
-        lastSeen:Date.now(),
-        updatedAt:Date.now(),
-        scoreboardActive:false
-      });
-      await storageSet(leavingUser.key,JSON.stringify(nextData),true);
-    }catch(e){}
-    _usersCache=_usersCache.filter(u=>u.name!==leavingUser.name);
+    const existing = _usersCache.find(u => u && u.name === prevUser.name) || {};
+    const hidden = Object.assign({}, existing, {
+      name: prevUser.name,
+      color: prevUser.color,
+      key: prevUser.key,
+      pwHash: existing.pwHash || prevUser.pwHash || '',
+      scoreboardActive: false,
+      online: false,
+      lastSeen: Date.now(),
+      updatedAt: Date.now(),
+      titleIndex: _normalizeTitleIndex(existing.titleIndex, existing.scores?.total || 0)
+    });
+    try{ await _ablyChannel('profiles').publish('profile.upsert', hidden); }catch(e){}
+    try{ await storageSet(prevUser.key, JSON.stringify(hidden), true); }catch(e){}
+    __saveProfileLocal(hidden);
+    _usersCache = _usersCache.filter(u => u && u.name !== prevUser.name);
+    _usersCacheTs = Date.now();
   }
   sbStopHeartbeat();
   chatStopPoll();
-  _currentUser=null; _duelState=null; _sbUserIndexed=false; _presenceDesired=false; _presenceJoined=false;
-  localStorage.removeItem('prepa_username');
-  localStorage.removeItem('prepa_pwhash');
-  updateSbUI(); chatRenderFooter();
-  go('scoreboard');
+  _currentUser = null;
+  _duelState = null;
+  _sbUserIndexed = false;
+  _presenceDesired = false;
+  _presenceJoined = false;
+  localStorage.removeItem(LOGIN_USER_STORAGE_KEY);
+  localStorage.removeItem(LOGIN_PW_STORAGE_KEY);
+  updateSbUI();
+  chatRenderFooter();
+  if(_currentView === 'scoreboard') go('scoreboard');
+  updateOnlineCount();
 }
 
 function showLoginModal(){
@@ -4753,11 +4818,11 @@ function showLoginModal(){
     </div>
   </div>`;
   document.body.appendChild(modal);
+  modal.onclick=e=>{ if(e.target===modal) modal.remove(); };
   setTimeout(()=>document.getElementById('sb-name-input')?.focus(),50);
 }
-
 async function sbLoginFromModal(){
-  const name=document.getElementById('sb-name-input')?.value;
+  const name=document.getElementById('sb-name-input')?.value?.trim();
   const pw=document.getElementById('sb-pw-input')?.value||'';
   const btn=document.getElementById('sb-login-submit-btn');
   if(!name?.trim()) return;
@@ -4767,30 +4832,24 @@ async function sbLoginFromModal(){
 }
 
 async function initUser(){
+  if(_onlineReinitDone) return;
+  _onlineReinitDone = true;
+  try{ if(_onlineHeartbeat){ clearTimeout(_onlineHeartbeat); _onlineHeartbeat = null; } }catch(e){}
+  _profilesHydrated = false;
+  _usersCache = [];
+  _usersCacheTs = 0;
+  _presenceMembers = {};
+  __loadLocalProfiles().forEach(profile => __mergeProfile(profile, {persist:false}));
+  updateSbUI();
+  chatRenderFooter();
   await ablyInit();
-  try{
-    for(let i=0;i<localStorage.length;i++){
-      const rawKey=localStorage.key(i);
-      const logical=_extractLogicalKeyFromLocalStorageKey(rawKey);
-      if(logical && _kv[logical]===undefined){
-        const value=localStorage.getItem(rawKey);
-        if(value!==null) _kv[logical]=value;
-      }
-    }
-  }catch(e){}
-  if(_ablyReady){
-    await _bootstrapKvFromHistory(true);
-    updateOnlineCount();
-  }
-  const saved=localStorage.getItem('prepa_username');
-  const savedPw=localStorage.getItem('prepa_pwhash')||'';
+  await _fetchAllUsers(true);
+  const saved=localStorage.getItem(LOGIN_USER_STORAGE_KEY);
+  const savedPw=localStorage.getItem(LOGIN_PW_STORAGE_KEY)||'';
   if(saved){
-    if(_ablyReady) await sbLogin(saved, savedPw?'__hash__'+savedPw:'');
-    else{
-      const colorIdx=Math.abs(saved.split('').reduce((a,ch)=>a+ch.charCodeAt(0),0))%USER_COLORS.length;
-      _currentUser={name:saved,color:USER_COLORS[colorIdx],key:sbUserKey(saved),pwHash:savedPw};
-      updateSbUI(); chatRenderFooter();
-    }
+    await sbLogin(saved, savedPw ? '__hash__'+savedPw : '');
+  }else{
+    updateOnlineCount();
   }
 }
 
@@ -4944,24 +5003,41 @@ const _sbTitleChoice = {};
 function getSbMaxUnlocked(score){ let max=0; SB_TITLES.forEach((t,i)=>{ if(score>=t.min) max=i; }); return max; }
 function getSbActiveTitle(userName, score){
   const maxIdx=getSbMaxUnlocked(score);
-  const sharedUser = _usersCache.find(u=>(u.key||sbUserKey(u.name))===sbUserKey(userName));
-  const sharedIdx = Number.isInteger(sharedUser?.titleIndex) ? sharedUser.titleIndex : undefined;
-  const chosen = sharedIdx!==undefined ? sharedIdx : _sbTitleChoice[userName];
-  if(chosen!==undefined&&chosen<=maxIdx) return SB_TITLES[chosen];
+  const liveProfile=_usersCache.find(u=>u&&u.name===userName) || null;
+  const chosen = Number.isInteger(_sbTitleChoice[userName])
+    ? _sbTitleChoice[userName]
+    : (Number.isInteger(liveProfile?.titleIndex) ? liveProfile.titleIndex : _getStoredTitleIndex(userName));
+  if(Number.isInteger(chosen) && chosen>=0 && chosen<=maxIdx) return SB_TITLES[chosen];
   return SB_TITLES[maxIdx];
 }
 async function setSbTitle(userName, idx){
-  if(!_currentUser || _currentUser.name!==userName) return;
+  idx = Math.max(0, Math.min(idx, SB_TITLES.length-1));
   _sbTitleChoice[userName]=idx;
-  try{ localStorage.setItem('prepa_title_'+userName,idx); }catch(e){}
-  await sbPushMyStats({ titleIndex: idx });
-  await _fetchAllUsers(true);
+  try{ localStorage.setItem('esh_eco_title_'+userName,idx); }catch(e){}
+  const liveProfile=_usersCache.find(u=>u&&u.name===userName);
+  if(liveProfile) liveProfile.titleIndex = idx;
+  if(_currentUser && _currentUser.name===userName){
+    await sbPushMyStats({titleIndex: idx});
+  }else if(liveProfile){
+    try{ await __publishProfile(Object.assign({}, liveProfile, {titleIndex: idx})); }catch(e){}
+  }
   const sbContent=document.getElementById('sb-content');
-  if(sbContent) sbRenderList(sbContent,_usersCache);
+  if(sbContent){
+    const users = await sbLoadAll();
+    sbRenderList(sbContent,users);
+  }
   document.getElementById('title-picker-'+userName)?.remove();
 }
 function loadSbTitleChoice(userName){
-  try{ const v=localStorage.getItem('prepa_title_'+userName); if(v!==null) _sbTitleChoice[userName]=parseInt(v); }catch(e){}
+  const liveProfile=_usersCache.find(u=>u&&u.name===userName);
+  if(Number.isInteger(liveProfile?.titleIndex)){
+    _sbTitleChoice[userName]=liveProfile.titleIndex;
+    return;
+  }
+  try{
+    const v=localStorage.getItem('esh_eco_title_'+userName);
+    if(v!==null) _sbTitleChoice[userName]=parseInt(v,10) || 0;
+  }catch(e){}
 }
 
 function sbRenderList(container, users){
@@ -5001,7 +5077,7 @@ function sbRenderList(container, users){
         <div style="flex:1;min-width:0">
           <div style="font-weight:600;font-size:13px;color:var(--fg)">${u.name}${isMe?' <span style="font-family:\'DM Mono\',monospace;font-size:8px;color:var(--t4)">(vous)</span>':''}</div>
           <div style="margin-top:3px;display:flex;align-items:center;flex-wrap:wrap;gap:3px">${titleBadge}${pickerBtn}</div>
-          <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--t4);margin-top:3px">🕐 ${formatLastSeen(u.lastSeen)} · 🔥 ${u.streak||0}j · ⚔️ ${u.duelsWon||0}</div>
+          <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--t4);margin-top:3px">🕐 ${formatLastSeen(u.lastSeen)} · 🔥 ${u.streak||0}j</div>
         </div>
         ${duelBtn}
         <div style="text-align:right;flex-shrink:0">
