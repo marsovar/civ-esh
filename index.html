@@ -4696,6 +4696,8 @@ async function sbCancelDuel(){
   if(_duelState?._timeout) clearTimeout(_duelState._timeout);
   if(_duelState?.key) try{ await storageSet(_duelState.key,JSON.stringify({status:'cancelled',ts:Date.now()}),true); }catch(e){}
   _duelState=null;
+  _duelFinished=false;
+  if(_duelGamePollTimer){clearInterval(_duelGamePollTimer);_duelGamePollTimer=null;}
   document.getElementById('duel-modal')?.remove();
 }
 
@@ -5049,8 +5051,13 @@ async function startDuelGame(opponentName){
   // Fermer toute modale d'attente
   document.getElementById('duel-modal')?.remove();
   document.getElementById('duel-notif-banner')?.remove();
+  // Réinitialiser l'état du jeu
   _duelMistakes=0; _duelOpponentMistakes=0; _duelScore=0; _duelQIdx=0;
   _duelFinished=false; _duelAnswered=false; _duelOppAnswered=0;
+  // Conserver le role existant ou mettre challenger par défaut
+  const role = _duelState?.role || 'challenger';
+  const key  = _duelState?.key  || duelKey(_currentUser.name, opponentName);
+  _duelState = { role, key, opponent: opponentName };
   _duelResultKey='esh_duel_result:'+[_currentUser.name,opponentName].sort().join(':');
   if(_ablyReady) try{ await storageSet(_duelResultKey,JSON.stringify({}),true); }catch(e){}
   const refs=buildWeightedQueue(ALL_REFS,300);
@@ -5225,6 +5232,8 @@ async function sbForfeitDuel(opponentName){
 
 function _showDuelEnd(opponentName,won){
   if(_duelGamePollTimer){clearInterval(_duelGamePollTimer);_duelGamePollTimer=null;}
+  _duelFinished=true;
+  _duelState=null;
   if(_currentUser&&_ablyReady) getDuelStats().then(({duelsPlayed,duelsWon})=>{
     sbPushMyStats({duelsPlayed:duelsPlayed+1,duelsWon:duelsWon+(won?1:0)});
   }).catch(()=>{});
@@ -6499,7 +6508,7 @@ function _chatRefreshBadge(){
 async function _loadChatHistory(){
   if(!_ablyReady||_chatHistoryLoaded) return;
   try{
-    const ch=_ablyChannel('chat');
+    const ch=_ablyChannel(ONLINE_CHAT_CHANNEL);
     const page=await ch.history({limit:CHAT_MAX,direction:'backwards'});
     const items=(page?.items||[]).reverse();
     const now=Date.now();
@@ -6607,7 +6616,7 @@ async function chatSend(){
   try{
     const msg={ts:Date.now(),author:_currentUser.name,color:_currentUser.color,text};
     // Publier via Ably pub/sub — reçu instantanément par tous via subscribe
-    await _ablyChannel('chat').publish('msg',msg);
+    await _ablyChannel(ONLINE_CHAT_CHANNEL).publish('msg',msg);
     // Ajouter localement immédiatement
     const exists=_chatMsgs.some(x=>x.ts===msg.ts&&x.author===msg.author);
     if(!exists){
