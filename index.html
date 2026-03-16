@@ -5046,6 +5046,9 @@ function _duelFlash(side, color){
 }
 
 async function startDuelGame(opponentName){
+  // Fermer toute modale d'attente
+  document.getElementById('duel-modal')?.remove();
+  document.getElementById('duel-notif-banner')?.remove();
   _duelMistakes=0; _duelOpponentMistakes=0; _duelScore=0; _duelQIdx=0;
   _duelFinished=false; _duelAnswered=false; _duelOppAnswered=0;
   _duelResultKey='esh_duel_result:'+[_currentUser.name,opponentName].sort().join(':');
@@ -5059,11 +5062,11 @@ async function startDuelGame(opponentName){
 
 function _startDuelAblyPush(opponentName){
   if(_duelGamePollTimer){ clearInterval(_duelGamePollTimer); _duelGamePollTimer=null; }
-  // Subscribe aux updates du duel via canal KV Ably
-  const kvCh=_ablyChannel('kv');
+  // Écouter les updates adversaire via le canal KV Ably
+  const kvCh=_ablyChannel(ONLINE_KV_CHANNEL);
   if(kvCh){
     kvCh.subscribe('set', async (msg)=>{
-      if(!msg.data || !_matchesStorageEventKey(msg.data.key, _duelResultKey)) return;
+      if(!msg.data || msg.data.key !== _duelResultKey) return;
       if(_duelFinished) return;
       try{
         const res=JSON.parse(msg.data.value);
@@ -5087,7 +5090,7 @@ function _startDuelAblyPush(opponentName){
       }catch(e){}
     });
   }
-  // Fallback poll toutes les 2s au cas où Ably push rate un message
+  // Fallback poll toutes les 2s
   _duelGamePollTimer=setInterval(async()=>{
     if(_duelFinished){ clearInterval(_duelGamePollTimer); return; }
     if(!_ablyReady) return;
@@ -5115,9 +5118,13 @@ function _startDuelAblyPush(opponentName){
 function _renderDuel(opponentName){
   _duelAnswered=false;
   const q=_duelQueue[_duelQIdx%_duelQueue.length];
+  // Supprimer toute modale d'attente existante et créer l'overlay duel en plein écran
   let overlay=document.getElementById('duel-modal');
-  if(!overlay){ overlay=document.createElement('div'); overlay.id='duel-modal'; document.body.appendChild(overlay); }
-  overlay.style.cssText='position:fixed;inset:0;background:var(--bg);z-index:2000;overflow-y:auto';
+  if(overlay) overlay.remove();
+  overlay=document.createElement('div');
+  overlay.id='duel-modal';
+  document.body.appendChild(overlay);
+  overlay.style.cssText='position:fixed;inset:0;background:var(--bg);z-index:2000;overflow-y:auto;display:block';
   overlay.innerHTML=`<div style="max-width:540px;margin:0 auto;padding:16px;width:100%;box-sizing:border-box">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
       <button onclick="sbForfeitDuel('${opponentName}')" style="background:none;border:none;color:var(--t4);cursor:pointer;font-size:11px;padding:4px">✕ Abandon</button>
