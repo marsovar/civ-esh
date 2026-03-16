@@ -873,6 +873,12 @@ body{background:var(--bg);color:var(--t1);font-family:var(--ff-sans);font-weight
 .chat-send:disabled{opacity:.4;cursor:default}
 .chat-login-hint{font-family:'DM Mono',monospace;font-size:10px;color:var(--t4);text-align:center;padding:10px;line-height:1.7}
 .chat-moderated{font-style:italic;color:var(--t4)!important;opacity:.6}
+.chat-bubble.pm{border:1px solid rgba(218,180,76,.24);box-shadow:inset 0 0 0 1px rgba(218,180,76,.08)}
+.chat-private-badge{display:inline-flex;align-items:center;gap:4px;font-family:'DM Mono',monospace;font-size:8px;padding:2px 6px;border-radius:999px;background:rgba(218,180,76,.12);border:1px solid rgba(218,180,76,.2);color:var(--gold2)}
+.chat-help-row{font-family:'DM Mono',monospace;font-size:8px;color:var(--t5);margin-top:5px;text-align:center;line-height:1.6}
+.chat-ac{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin-top:7px}
+.chat-ac-item{background:var(--s2);border:1px solid var(--bd);border-radius:999px;padding:4px 9px;color:var(--t3);cursor:pointer;font-family:'DM Mono',monospace;font-size:9px;transition:.12s}
+.chat-ac-item:hover,.chat-ac-item.active{border-color:var(--gold2);color:var(--gold2);background:rgba(218,180,76,.08)}
 
 
 .tl-card,.fc,.mm-ref-card{will-change:transform;}
@@ -3435,6 +3441,94 @@ function refreshCatChips(){
 }
 function shuffle(a){ const r=a.slice(); for(let i=r.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [r[i],r[j]]=[r[j],r[i]]; } return r; }
 
+function buildQuizQuestion(ref, mode='date_author', dir='forward', pool){
+  const sourcePool=(Array.isArray(pool)&&pool.length?pool:(Array.isArray(qScopeRefs)&&qScopeRefs.length?qScopeRefs:ALL_REFS)).filter(Boolean);
+  if(!ref||!sourcePool.length) return null;
+  const forward = dir==='reverse' ? false : true;
+  const uniq = arr => [...new Set((arr||[]).filter(v=>v!==undefined&&v!==null&&String(v).trim()!==''))];
+  const shortTitle = t => String(t||'').length>85 ? String(t).slice(0,85)+'…' : String(t||'');
+  const uniqueChoices = (correct, primary, fallback) => {
+    const items = uniq([correct, ...(primary||[]), ...(fallback||[])].map(v=>String(v||'').trim())).filter(v=>v&&v!==String(correct));
+    const out = [String(correct||'').trim(), ...items.slice(0,3)];
+    return shuffle(out).slice(0,4);
+  };
+
+  let q='', hint='', correct='', choices=[], label='';
+
+  if(mode==='date_author'){
+    if(forward){
+      const sameYear = sourcePool.filter(r=>r && r!==ref && r.year===ref.year);
+      const blocked = new Set([ref.author, ...sameYear.map(r=>r.author)]);
+      q = String(ref.year);
+      hint = `<em style="font-size:10.5px;color:var(--t4)">${ref.title}</em> — Quel auteur ?`;
+      correct = ref.author;
+      label = 'Date → Auteur';
+      const primary = shuffle(sourcePool.filter(r=>r && r.cat===ref.cat && !blocked.has(r.author)).map(r=>r.author));
+      const fallback = shuffle(sourcePool.filter(r=>r && !blocked.has(r.author)).map(r=>r.author));
+      choices = uniqueChoices(correct, primary, fallback);
+    } else {
+      const blockedYears = new Set(sourcePool.filter(r=>r && r.author===ref.author).map(r=>String(r.year)));
+      q = ref.author;
+      hint = `En quelle année publie-t-il <em style="font-size:10.5px">${ref.title}</em> ?`;
+      correct = String(ref.year);
+      label = 'Auteur → Date';
+      const primary = shuffle(sourcePool.filter(r=>r && r.author!==ref.author && r.cat===ref.cat).map(r=>String(r.year)).filter(y=>!blockedYears.has(y)));
+      const fallback = shuffle(sourcePool.filter(r=>r && r.author!==ref.author).map(r=>String(r.year)).filter(y=>!blockedYears.has(y)));
+      choices = uniqueChoices(correct, primary, fallback);
+    }
+  }else if(mode==='concept_author'){
+    if(forward){
+      q = ref.concept;
+      hint = `<em style="font-size:10.5px;color:var(--t4)">${ref.title} (${ref.year})</em> — À quel auteur ?`;
+      correct = ref.author;
+      label = 'Concept → Auteur';
+      const primary = shuffle(sourcePool.filter(r=>r && r!==ref && r.cat===ref.cat).map(r=>r.author));
+      const fallback = shuffle(sourcePool.filter(r=>r && r!==ref).map(r=>r.author));
+      choices = uniqueChoices(correct, primary, fallback);
+    } else {
+      q = ref.author;
+      hint = `<em style="font-size:10.5px;color:var(--t4)">${ref.title} (${ref.year})</em> — Quel est le concept clé ?`;
+      correct = ref.concept;
+      label = 'Auteur → Concept';
+      const primary = shuffle(sourcePool.filter(r=>r && r!==ref && r.cat===ref.cat).map(r=>r.concept));
+      const fallback = shuffle(sourcePool.filter(r=>r && r!==ref).map(r=>r.concept));
+      choices = uniqueChoices(correct, primary, fallback);
+    }
+  }else{
+    if(forward){
+      q = shortTitle(ref.title);
+      hint = "Quel est l'auteur de ce texte ?";
+      correct = ref.author;
+      label = 'Titre → Auteur';
+      const primary = shuffle(sourcePool.filter(r=>r && r!==ref && r.cat===ref.cat).map(r=>r.author));
+      const fallback = shuffle(sourcePool.filter(r=>r && r!==ref).map(r=>r.author));
+      choices = uniqueChoices(correct, primary, fallback);
+    } else {
+      const blockedTitles = new Set(sourcePool.filter(r=>r && r.author===ref.author).map(r=>shortTitle(r.title)));
+      q = ref.author;
+      hint = `Quel titre publie-t-il en ${ref.year} ?`;
+      correct = shortTitle(ref.title);
+      label = 'Auteur → Titre';
+      const primary = shuffle(sourcePool.filter(r=>r && r.author!==ref.author && r.cat===ref.cat).map(r=>shortTitle(r.title)).filter(t=>!blockedTitles.has(t)));
+      const fallback = shuffle(sourcePool.filter(r=>r && r.author!==ref.author).map(r=>shortTitle(r.title)).filter(t=>!blockedTitles.has(t)));
+      choices = uniqueChoices(correct, primary, fallback);
+    }
+  }
+
+  if(choices.length<4) return null;
+  return {
+    ref,
+    label,
+    q,
+    hint,
+    choices,
+    correct,
+    correctIdx: choices.indexOf(correct),
+    mode,
+    dir: forward ? 'forward' : 'reverse'
+  };
+}
+
 function buildQueue(){
   let pool=qScopeRefs.filter(r=>{
     if(qCatFilter!=='all' && r.cat!==qCatFilter) return false;
@@ -4339,11 +4433,12 @@ function _setupAbly(resolve){
         chatCh.subscribe('msg',msg=>{
           const m=msg.data;
           if(!m||!m.ts||!m.author) return;
+          if(!_chatCanSeeMessage(m)) return;
           const now=Date.now();
-          const exists=_chatMsgs.some(x=>x.ts===m.ts&&x.author===m.author);
+          const exists=_chatMsgs.some(x=>x.ts===m.ts&&x.author===m.author&&x.to===m.to&&x.scope===m.scope);
           if(exists) return;
           _chatMsgs.push(m);
-          _chatMsgs=_chatMsgs.filter(x=>(now-x.ts)<CHAT_TTL).slice(-CHAT_MAX);
+          _chatMsgs=_chatMsgs.filter(x=>(now-x.ts)<CHAT_TTL&&_chatCanSeeMessage(x)).slice(-CHAT_MAX);
           _chatMsgs.sort((a,b)=>a.ts-b.ts);
           if(_chatOpen){ chatRenderMessages(); _chatMarkRead(); }
           else if(m.author!==_currentUser?.name&&m.ts>_chatLastSeen){ _chatUnread++; _chatRefreshBadge(); }
@@ -4638,7 +4733,7 @@ function _showToast(msg,color='var(--navy)'){
 let _duelPollTimer=null;
 function sbPollDuel(){ /* no-op — géré par Ably push */ }
 
-function duelKey(a,b){ return 'esh_duel:'+sbUserKey(a)+':'+sbUserKey(b); }
+function duelKey(a,b){ return 'esh_duel:'+ [sbUserKey(a),sbUserKey(b)].sort().join(':'); }
 
 async function sbRequestDuel(targetName){
   if(!_currentUser||!_ablyReady) return;
@@ -4681,7 +4776,7 @@ async function sbAcceptDuel(from,key){
   _duelState={role:'defender',key,opponent:from};
   try{ await storageSet(key,JSON.stringify({from,to:_currentUser.name,status:'accepted',ts:Date.now()}),true); }catch(e){}
   try{ await _ablyChannel(ONLINE_DUELS_CHANNEL).publish('accept',{from:_currentUser.name,to:from,key}); }catch(e){}
-  startDuelGame(from);
+  await startDuelGame(from);
 }
 
 async function sbDeclineDuel(from,key){
@@ -4693,8 +4788,12 @@ async function sbDeclineDuel(from,key){
 }
 
 async function sbCancelDuel(){
-  if(_duelState?._timeout) clearTimeout(_duelState._timeout);
-  if(_duelState?.key) try{ await storageSet(_duelState.key,JSON.stringify({status:'cancelled',ts:Date.now()}),true); }catch(e){}
+  const state=_duelState?{..._duelState}:null;
+  if(state?._timeout) clearTimeout(state._timeout);
+  if(state?.key) try{ await storageSet(state.key,JSON.stringify({status:'cancelled',ts:Date.now()}),true); }catch(e){}
+  if(state?.role==='challenger'&&state?.opponent&&_ablyReady){
+    try{ await _ablyChannel(ONLINE_DUELS_CHANNEL).publish('cancel',{from:_currentUser?.name,to:state.opponent,key:state.key}); }catch(e){}
+  }
   _duelState=null;
   _duelFinished=false;
   if(_duelGamePollTimer){clearInterval(_duelGamePollTimer);_duelGamePollTimer=null;}
@@ -5048,23 +5147,35 @@ function _duelFlash(side, color){
 }
 
 async function startDuelGame(opponentName){
-  // Fermer toute modale d'attente
-  document.getElementById('duel-modal')?.remove();
-  document.getElementById('duel-notif-banner')?.remove();
-  // Réinitialiser l'état du jeu
-  _duelMistakes=0; _duelOpponentMistakes=0; _duelScore=0; _duelQIdx=0;
-  _duelFinished=false; _duelAnswered=false; _duelOppAnswered=0;
-  // Conserver le role existant ou mettre challenger par défaut
-  const role = _duelState?.role || 'challenger';
-  const key  = _duelState?.key  || duelKey(_currentUser.name, opponentName);
-  _duelState = { role, key, opponent: opponentName };
-  _duelResultKey='esh_duel_result:'+[_currentUser.name,opponentName].sort().join(':');
-  if(_ablyReady) try{ await storageSet(_duelResultKey,JSON.stringify({}),true); }catch(e){}
-  const refs=buildWeightedQueue(ALL_REFS,300);
-  _duelQueue=refs.map(ref=>buildQuizQuestion(ref,DUEL_MODES[Math.floor(Math.random()*DUEL_MODES.length)],Math.random()<.5?'forward':'reverse'));
-  // Écouter les updates adversaire via Ably push (remplace le poll)
-  _startDuelAblyPush(opponentName);
-  _renderDuel(opponentName);
+  try{
+    if(!_currentUser) return;
+    // Fermer toute modale d'attente
+    document.getElementById('duel-modal')?.remove();
+    document.getElementById('duel-notif-banner')?.remove();
+    // Réinitialiser l'état du jeu
+    _duelMistakes=0; _duelOpponentMistakes=0; _duelScore=0; _duelQIdx=0;
+    _duelFinished=false; _duelAnswered=false; _duelOppAnswered=0;
+    // Conserver le role existant ou mettre challenger par défaut
+    const role = _duelState?.role || 'challenger';
+    const key  = _duelState?.key  || duelKey(_currentUser.name, opponentName);
+    _duelState = { role, key, opponent: opponentName };
+    _duelResultKey='esh_duel_result:'+[_currentUser.name,opponentName].sort().join(':');
+    if(_ablyReady) try{ await storageSet(_duelResultKey,JSON.stringify({}),true); }catch(e){}
+    const refs=buildWeightedQueue(ALL_REFS,300);
+    _duelQueue=refs.map(ref=>buildQuizQuestion(ref,DUEL_MODES[Math.floor(Math.random()*DUEL_MODES.length)],Math.random()<.5?'forward':'reverse',ALL_REFS)).filter(q=>q&&Array.isArray(q.choices)&&q.choices.length===4&&q.correctIdx>=0);
+    if(!_duelQueue.length) throw new Error('DUEL_QUEUE_EMPTY');
+    // Écouter les updates adversaire via Ably push (remplace le poll)
+    _startDuelAblyPush(opponentName);
+    _renderDuel(opponentName);
+  }catch(e){
+    console.warn('[Duel] start error:',e);
+    _duelState=null;
+    _duelFinished=false;
+    if(_duelGamePollTimer){clearInterval(_duelGamePollTimer);_duelGamePollTimer=null;}
+    document.getElementById('duel-modal')?.remove();
+    document.getElementById('duel-notif-banner')?.remove();
+    _showToast('Impossible de lancer le duel. Réessaie.','var(--red)');
+  }
 }
 
 function _startDuelAblyPush(opponentName){
@@ -6468,6 +6579,100 @@ let _chatPollTimer  = null;
 let _chatLastSeen   = 0;   // timestamp du dernier message vu
 let _chatMsgs       = [];  // cache local
 let _chatUnread     = 0;
+let _chatPmActiveIdx = 0;
+let _chatPmLastToken = '';
+
+function chatEsc(s){
+  return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function _chatCanSeeMessage(m, viewer=_currentUser?.name||''){
+  if(!m||!m.ts||!m.author) return false;
+  if(m.scope==='private') return !!viewer && (m.author===viewer || m.to===viewer);
+  return true;
+}
+function _chatVisibleMessages(viewer=_currentUser?.name||''){
+  return _chatMsgs.filter(m=>_chatCanSeeMessage(m,viewer));
+}
+function _chatGetRecipientCandidates(){
+  const map=new Map();
+  const add=u=>{
+    if(!u?.name||u.name===_currentUser?.name) return;
+    const key=u.name.toLowerCase();
+    if(!map.has(key)) map.set(key,{name:u.name,color:u.color||'var(--navy)'});
+  };
+  (_usersCache||[]).forEach(add);
+  Object.values(_presenceMembers||{}).forEach(add);
+  return [...map.values()].sort((a,b)=>a.name.localeCompare(b.name,'fr',{sensitivity:'base'}));
+}
+function _chatResolveRecipient(name){
+  const wanted=String(name||'').trim().toLowerCase();
+  if(!wanted) return null;
+  const found=_chatGetRecipientCandidates().find(u=>u.name.toLowerCase()===wanted);
+  return found?found.name:null;
+}
+function _chatParseCommand(raw){
+  const value=String(raw||'').replace(/\r/g,'');
+  const match=value.match(/^\/msg(?:\s+([^\s]*))?(?:\s+([\s\S]*))?$/);
+  if(!match) return {isPm:false, raw:value};
+  const hasBody=/^\/msg\s+\S+\s/.test(value);
+  return {
+    isPm:true,
+    raw:value,
+    targetToken:match[1]||'',
+    body:hasBody?(match[2]||''):'',
+    selectingRecipient:!hasBody
+  };
+}
+function _chatPmMatches(token){
+  const q=String(token||'').trim().toLowerCase();
+  const candidates=_chatGetRecipientCandidates();
+  if(!q) return candidates;
+  return candidates.filter(u=>u.name.toLowerCase().startsWith(q)||u.name.toLowerCase().includes(q));
+}
+function _chatSetInputValue(value){
+  const input=document.getElementById('chat-input');
+  if(!input) return;
+  input.value=value;
+  input.style.height='auto';
+  input.style.height=Math.min(input.scrollHeight,80)+'px';
+  const pos=input.value.length;
+  try{ input.setSelectionRange(pos,pos); }catch(e){}
+}
+function chatApplyPmTarget(name){
+  const input=document.getElementById('chat-input');
+  if(!input) return;
+  const parsed=_chatParseCommand(input.value);
+  const body=parsed.isPm&&parsed.body?parsed.body:'';
+  _chatSetInputValue('/msg '+name+' '+body);
+  input.focus();
+  chatRenderFooter();
+}
+function chatHandleInput(el){
+  if(!el) return;
+  el.style.height='auto';
+  el.style.height=Math.min(el.scrollHeight,80)+'px';
+  chatRenderFooter();
+}
+function chatInputKeydown(event){
+  if(event.key==='Enter'&&!event.shiftKey){
+    event.preventDefault();
+    chatSend();
+    return;
+  }
+  if(event.key==='Tab'){
+    const parsed=_chatParseCommand(event.target?.value||'');
+    if(parsed.isPm&&parsed.selectingRecipient){
+      const matches=_chatPmMatches(parsed.targetToken);
+      if(matches.length){
+        event.preventDefault();
+        const token=parsed.targetToken.toLowerCase();
+        _chatPmActiveIdx = (_chatPmLastToken===token) ? ((_chatPmActiveIdx+1)%matches.length) : 0;
+        _chatPmLastToken = token;
+        chatApplyPmTarget(matches[_chatPmActiveIdx].name);
+      }
+    }
+  }
+}
 
 function chatToggle(){
   _chatOpen ? chatClose() : chatOpen();
@@ -6516,15 +6721,16 @@ async function _loadChatHistory(){
       const m=msg.data;
       if(!m||!m.ts||!m.author) return;
       if((now-m.ts)>=CHAT_TTL) return;
-      const exists=_chatMsgs.some(x=>x.ts===m.ts&&x.author===m.author);
+      if(!_chatCanSeeMessage(m)) return;
+      const exists=_chatMsgs.some(x=>x.ts===m.ts&&x.author===m.author&&x.to===m.to&&x.scope===m.scope);
       if(!exists) _chatMsgs.push(m);
     });
     _chatMsgs.sort((a,b)=>a.ts-b.ts);
-    _chatMsgs=_chatMsgs.slice(-CHAT_MAX);
+    _chatMsgs=_chatMsgs.filter(m=>_chatCanSeeMessage(m)).slice(-CHAT_MAX);
     _chatHistoryLoaded=true;
     if(_chatOpen){ chatRenderMessages(); _chatMarkRead(); }
     const me=_currentUser?.name;
-    const unread=_chatMsgs.filter(m=>m.ts>_chatLastSeen&&m.author!==me).length;
+    const unread=_chatVisibleMessages(me).filter(m=>m.ts>_chatLastSeen&&m.author!==me).length;
     if(unread>0){ _chatUnread=unread; _chatRefreshBadge(); }
   }catch(e){ console.warn('[Chat] history error:',e); }
 }
@@ -6541,19 +6747,20 @@ function chatRenderMessages(){
   if(!container) return;
   const now = Date.now();
   const me = _currentUser?.name;
-  if(!_chatMsgs.length){
+  const visibleMsgs = _chatVisibleMessages(me);
+  if(!visibleMsgs.length){
     container.innerHTML = `<div class="chat-empty">Aucun message.<br>Sois le premier à écrire !</div>`;
     return;
   }
   const wasAtBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 60;
 
-  // Grouper les messages consécutifs du même auteur (≤ 3 minutes d'écart)
   const GROUP_GAP = 3 * 60 * 1000;
   let html = '';
-  _chatMsgs.forEach((m, idx) => {
+  visibleMsgs.forEach((m, idx) => {
     const isMe = m.author === me;
-    const prev = _chatMsgs[idx - 1];
-    const isGrouped = prev && prev.author === m.author && (m.ts - prev.ts) < GROUP_GAP;
+    const isPm = m.scope === 'private';
+    const prev = visibleMsgs[idx - 1];
+    const isGrouped = prev && prev.author === m.author && prev.scope === m.scope && prev.to === m.to && (m.ts - prev.ts) < GROUP_GAP;
     const age = now - m.ts;
     const remaining = CHAT_TTL - age;
     const remH = Math.max(0, Math.floor(remaining / 3600000));
@@ -6561,26 +6768,26 @@ function chatRenderMessages(){
     const timeStr = new Date(m.ts).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'});
     const ttlStr  = remaining < 3600000 ? `expire dans ${remM}m` : `expire dans ${remH}h${remM>0?remM+'m':''}`;
     const colorStyle = m.color ? `background:${m.color}` : 'background:var(--t4)';
+    const pmBadge = isPm ? `<span class="chat-private-badge">${isMe ? 'MP → '+chatEsc(m.to||'?') : 'Message privé'}</span>` : '';
 
     if(isGrouped){
-      // Message collé : juste la bulle, pas de header
       html += `<div class="chat-msg${isMe?' me':''}" style="margin-top:2px">
-        <div class="chat-bubble">${m.text}</div>
+        <div class="chat-bubble${isPm?' pm':''}">${m.text}</div>
       </div>`;
     } else {
-      // Premier message du groupe : header complet
       html += `<div class="chat-msg${isMe?' me':''}" style="margin-top:10px">
         <div class="chat-msg-header">
-          <div class="chat-msg-avatar" style="${colorStyle}">${m.author[0].toUpperCase()}</div>
-          <span class="chat-msg-name">${isMe?'Vous':m.author}</span>
+          <div class="chat-msg-avatar" style="${colorStyle}">${chatEsc(m.author[0].toUpperCase())}</div>
+          <span class="chat-msg-name">${isMe?'Vous':chatEsc(m.author)}</span>
+          ${pmBadge}
           <span class="chat-msg-time">${timeStr} · <span style="color:var(--t5);font-size:7.5px">${ttlStr}</span></span>
         </div>
-        <div class="chat-bubble">${m.text}</div>
+        <div class="chat-bubble${isPm?' pm':''}">${m.text}</div>
       </div>`;
     }
   });
   container.innerHTML = html;
-  if(wasAtBottom || _chatMsgs.length <= 3){
+  if(wasAtBottom || visibleMsgs.length <= 3){
     container.scrollTop = container.scrollHeight;
   }
 }
@@ -6592,14 +6799,24 @@ function chatRenderFooter(){
     footer.innerHTML = `<div class="chat-login-hint">Connecte-toi au scoreboard<br>pour participer au chat.</div>`;
     return;
   }
+  const currentValue = document.getElementById('chat-input')?.value || '';
+  const parsed = _chatParseCommand(currentValue);
+  const matches = parsed.isPm && parsed.selectingRecipient ? _chatPmMatches(parsed.targetToken) : [];
   footer.innerHTML = `
     <div class="chat-input-row">
       <textarea class="chat-input" id="chat-input" placeholder="Écris un message…" rows="1"
-        onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();chatSend();}"
-        oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,80)+'px'"></textarea>
+        onkeydown="chatInputKeydown(event)"
+        oninput="chatHandleInput(this)"></textarea>
       <button class="chat-send" id="chat-send-btn" onclick="chatSend()" title="Envoyer">➤</button>
     </div>
-    <div style="font-family:'DM Mono',monospace;font-size:8px;color:var(--t5);margin-top:5px;text-align:center">Messages conservés 72h · Respect requis</div>`;
+    <div id="chat-help" class="chat-help-row">${parsed.isPm ? 'Commande privée active · Tab pour compléter le destinataire' : 'Messages conservés 72h · /msg pseudo ton message pour un MP'}</div>
+    ${matches.length ? `<div class="chat-ac" id="chat-ac-list">${matches.slice(0,6).map((u,i)=>`<button type="button" class="chat-ac-item${i===_chatPmActiveIdx?' active':''}" onclick="chatApplyPmTarget(${JSON.stringify(u.name)})">${chatEsc(u.name)}</button>`).join('')}</div>` : ''}`;
+  const input = document.getElementById('chat-input');
+  if(input){
+    input.value = currentValue;
+    input.style.height='auto';
+    input.style.height=Math.min(input.scrollHeight,80)+'px';
+  }
 }
 
 async function chatSend(){
@@ -6607,26 +6824,41 @@ async function chatSend(){
   const input = document.getElementById('chat-input');
   if(!input) return;
   const raw = input.value;
-  const text = chatModerate(raw);
-  if(!text){ input.value=''; return; } // modéré silencieusement
+  const parsed = _chatParseCommand(raw);
+  let msg = null;
+
+  if(parsed.isPm){
+    const recipient = _chatResolveRecipient(parsed.targetToken);
+    const body = chatModerate(parsed.body||'');
+    if(!recipient){ _showToast('Destinataire introuvable pour le message privé.','var(--red)'); return; }
+    if(recipient===_currentUser.name){ _showToast("Tu ne peux pas t'envoyer un message privé.",'var(--red)'); return; }
+    if(!body){ input.value=''; chatRenderFooter(); return; }
+    msg={ts:Date.now(),author:_currentUser.name,color:_currentUser.color,text:body,scope:'private',to:recipient};
+  }else{
+    const text = chatModerate(raw);
+    if(!text){ input.value=''; chatRenderFooter(); return; }
+    msg={ts:Date.now(),author:_currentUser.name,color:_currentUser.color,text,scope:'public'};
+  }
+
   const btn = document.getElementById('chat-send-btn');
   if(btn) btn.disabled = true;
   input.value = '';
   input.style.height = 'auto';
   try{
-    const msg={ts:Date.now(),author:_currentUser.name,color:_currentUser.color,text};
-    // Publier via Ably pub/sub — reçu instantanément par tous via subscribe
     await _ablyChannel(ONLINE_CHAT_CHANNEL).publish('msg',msg);
-    // Ajouter localement immédiatement
-    const exists=_chatMsgs.some(x=>x.ts===msg.ts&&x.author===msg.author);
-    if(!exists){
+    const exists=_chatMsgs.some(x=>x.ts===msg.ts&&x.author===msg.author&&x.to===msg.to&&x.scope===msg.scope);
+    if(!exists && _chatCanSeeMessage(msg)){
       _chatMsgs.push(msg);
-      _chatMsgs=_chatMsgs.slice(-CHAT_MAX);
+      _chatMsgs=_chatMsgs.filter(x=>_chatCanSeeMessage(x)).slice(-CHAT_MAX);
       _chatLastSeen=msg.ts;
       chatRenderMessages();
     }
   }catch(e){ console.warn('[Chat] send error:',e); }
-  finally{ if(btn) btn.disabled=false; input.focus(); }
+  finally{
+    if(btn) btn.disabled=false;
+    chatRenderFooter();
+    input.focus();
+  }
 }
 
 loadMastery();
