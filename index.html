@@ -5084,8 +5084,7 @@ function sbRenderList(container, users){
     const duelBtn=canDuel?`<button onclick="sbRequestDuel('${u.name}')" style="font-family:'DM Mono',monospace;
     const adminBtn=(_currentUser && _currentUser.name==='marso' && !isMe)
       ? `<button onclick="event.stopPropagation();sbAdminDeleteUser('${u.name}')" style="margin-left:6px;font-family:'DM Mono',monospace;font-size:8px;padding:3px 8px;background:#8b0000;border:1px solid #ff4d4d;border-radius:4px;color:#fff;cursor:pointer">🗑 Suppr</button>`
-      : '';
-font-size:8px;padding:3px 8px;background:var(--s2);border:1px solid var(--gold2);border-radius:4px;color:var(--gold2);cursor:pointer;white-space:nowrap">⚔️ Duel</button>`:'';
+      : '';font-size:8px;padding:3px 8px;background:var(--s2);border:1px solid var(--gold2);border-radius:4px;color:var(--gold2);cursor:pointer;white-space:nowrap">⚔️ Duel</button>`:'';
     loadSbTitleChoice(u.name);
     const title=getSbActiveTitle(u.name,score);
     const maxIdx=getSbMaxUnlocked(score);
@@ -5103,7 +5102,7 @@ font-size:8px;padding:3px 8px;background:var(--s2);border:1px solid var(--gold2)
           <div style="margin-top:3px;display:flex;align-items:center;flex-wrap:wrap;gap:3px">${titleBadge}${pickerBtn}</div>
           <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--t4);margin-top:3px">🕐 ${formatLastSeen(u.lastSeen)} · 🔥 ${u.streak||0}j</div>
         </div>
-        ${duelBtn}${adminBtn}
+        ${duelBtn}${adminBtn}${adminBtn}
         <div style="text-align:right;flex-shrink:0">
           <div style="font-family:'Cormorant Garamond',serif;font-size:26px;font-weight:600;color:${scoreColor};line-height:1">${score}<span style="font-size:12px;font-weight:400">%</span></div>
         </div>
