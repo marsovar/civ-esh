@@ -5081,7 +5081,11 @@ function sbRenderList(container, users){
     const scoreColor=score>=80?'var(--green)':score>=50?'var(--navy)':'var(--t3)';
     const onlineDot=`<div data-sb-dot="${u.name}" title="${online?'En ligne':'Hors ligne'}" style="width:8px;height:8px;border-radius:50%;background:${online?'#2ecc71':'var(--s3)'};flex-shrink:0;${online?'box-shadow:0 0 3px rgba(46,204,113,.45)':''}"></div>`;
     const canDuel=_currentUser&&online&&!isMe;
-    const duelBtn=canDuel?`<button onclick="sbRequestDuel('${u.name}')" style="font-family:'DM Mono',monospace;font-size:8px;padding:3px 8px;background:var(--s2);border:1px solid var(--gold2);border-radius:4px;color:var(--gold2);cursor:pointer;white-space:nowrap">⚔️ Duel</button>`:'';
+    const duelBtn=canDuel?`<button onclick="sbRequestDuel('${u.name}')" style="font-family:'DM Mono',monospace;
+    const adminBtn=(_currentUser && _currentUser.name==='marso' && !isMe)
+      ? `<button onclick="event.stopPropagation();sbAdminDeleteUser('${u.name}')" style="margin-left:6px;font-family:'DM Mono',monospace;font-size:8px;padding:3px 8px;background:#8b0000;border:1px solid #ff4d4d;border-radius:4px;color:#fff;cursor:pointer">🗑 Suppr</button>`
+      : '';
+font-size:8px;padding:3px 8px;background:var(--s2);border:1px solid var(--gold2);border-radius:4px;color:var(--gold2);cursor:pointer;white-space:nowrap">⚔️ Duel</button>`:'';
     loadSbTitleChoice(u.name);
     const title=getSbActiveTitle(u.name,score);
     const maxIdx=getSbMaxUnlocked(score);
@@ -5099,7 +5103,7 @@ function sbRenderList(container, users){
           <div style="margin-top:3px;display:flex;align-items:center;flex-wrap:wrap;gap:3px">${titleBadge}${pickerBtn}</div>
           <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--t4);margin-top:3px">🕐 ${formatLastSeen(u.lastSeen)} · 🔥 ${u.streak||0}j</div>
         </div>
-        ${duelBtn}
+        ${duelBtn}${adminBtn}
         <div style="text-align:right;flex-shrink:0">
           <div style="font-family:'Cormorant Garamond',serif;font-size:26px;font-weight:600;color:${scoreColor};line-height:1">${score}<span style="font-size:12px;font-weight:400">%</span></div>
         </div>
@@ -7051,6 +7055,22 @@ recordAnswer = function(ref, ok){
   clearTimeout(recordAnswer._pushTimer);
   recordAnswer._pushTimer = setTimeout(()=>{ if(_currentUser) sbPushMyStats(); }, 8000);
 };
+
+async function sbAdminDeleteUser(name){
+  if(!_currentUser || _currentUser.name!=='marso'){ alert("Action réservée à l'admin"); return;}
+  if(!confirm("Supprimer "+name+" du scoreboard ?")) return;
+  try{
+    const idx=await storageGet('players:index',true);
+    let arr=idx&&idx.value?JSON.parse(idx.value):[];
+    arr=arr.filter(n=>n!==name);
+    await storageSet('players:index',JSON.stringify(arr),true);
+    await storageSet('players:'+name,'',true);
+    _usersCache=_usersCache.filter(u=>u.name!==name);
+    const el=document.getElementById('sb-content');
+    if(el) sbRenderList(el,_usersCache);
+  }catch(e){console.error(e);alert("Erreur suppression");}
+}
+
 </script>
 <script>
 (function(){
