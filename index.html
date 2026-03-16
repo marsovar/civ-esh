@@ -3992,6 +3992,7 @@ function loadQuizConfig(){
 // ─── Canaux Ably ───────────────────────────────────────────────
 const ONLINE_PROFILES_CHANNEL = 'esh:profiles:v1';
 const ONLINE_PRESENCE_CHANNEL = 'esh:presence:v1';
+const PLAYERS_SNAPSHOT_KEY   = 'players:snapshot:v1';
 const ONLINE_DUELS_CHANNEL    = 'esh:duels:v1';
 const ONLINE_CHAT_CHANNEL     = 'esh:chat';
 const ONLINE_KV_CHANNEL       = 'esh:kv';
@@ -4131,7 +4132,7 @@ function __mergeProfile(profile, opts){
   }else{
     _usersCache.push(normalized);
   }
-  _usersCache=_usersCache.filter(u=>u&&u.name&&u.scoreboardActive!==false);
+  _usersCache=_usersCache.filter(u=>u&&u.name);
   _usersCache.sort((a,b)=>(b.scores?.total||0)-(a.scores?.total||0)||((b.bestStreak||0)-(a.bestStreak||0))||a.name.localeCompare(b.name,'fr'));
   _usersCacheTs=Date.now();
   if(_currentView==='scoreboard'&&typeof sbRenderList==='function'){
@@ -4139,6 +4140,43 @@ function __mergeProfile(profile, opts){
     if(el) sbRenderList(el,_usersCache);
   }
   return normalized;
+}
+
+async function __publishPlayersSnapshot(){
+  const players=(_usersCache||[])
+    .filter(u=>u&&u.name&&u.scoreboardActive!==false)
+    .map(u=>({
+      name:u.name,
+      color:u.color,
+      key:u.key||sbUserKey(u.name),
+      pwHash:u.pwHash||'',
+      scores:Object.assign(__buildEmptyScores(), u.scores||{}),
+      streak:u.streak||0,
+      bestStreak:u.bestStreak||0,
+      duelsWon:u.duelsWon||0,
+      duelsPlayed:u.duelsPlayed||0,
+      lastSeen:u.lastSeen||0,
+      updatedAt:u.updatedAt||u.lastSeen||Date.now(),
+      scoreboardActive:u.scoreboardActive!==false,
+      online:!!u.online,
+      titleIndex:Number.isInteger(u.titleIndex)?u.titleIndex:(parseInt(u.titleIndex,10)||0)
+    }));
+  if(!players.length) return null;
+  const payload={updatedAt:Date.now(),players};
+  try{ await storageSet(PLAYERS_SNAPSHOT_KEY,JSON.stringify(payload),true); }catch(e){}
+  return payload;
+}
+
+async function __loadProfilesFromSnapshot(){
+  try{
+    const raw=await storageGet(PLAYERS_SNAPSHOT_KEY,true);
+    if(!raw?.value) return false;
+    const data=JSON.parse(raw.value);
+    const players=Array.isArray(data)?data:(Array.isArray(data?.players)?data.players:[]);
+    players.forEach(p=>{ if(p?.name) __mergeProfile(p,{persist:true}); });
+    return players.length>0;
+  }catch(e){}
+  return false;
 }
 
 // ─── Publish profile ───────────────────────────────────────────
@@ -4161,6 +4199,7 @@ async function __publishProfile(profile){
     if(!idx.keys.includes(snapshot.key)) idx.keys.push(snapshot.key);
     await storageSet('players:index',JSON.stringify(idx),true);
   }catch(e){}
+  try{ await __publishPlayersSnapshot(); }catch(e){}
   return snapshot;
 }
 
@@ -4232,7 +4271,7 @@ async function storageList(prefix,shared){
 function _ablyChannel(name){
   if(!_ably) return null;
   if(!_ablyChannels[name]){
-    const opts=(name===ONLINE_PROFILES_CHANNEL)?{params:{rewind:'200'}}:{};
+    const opts=(name===ONLINE_PROFILES_CHANNEL||name===ONLINE_KV_CHANNEL)?{params:{rewind:'200'}}:{};
     _ablyChannels[name]=_ably.channels.get(name,opts);
   }
   return _ablyChannels[name];
@@ -4291,6 +4330,7 @@ async function __loadProfilesFromHistory(force){
   const now=Date.now();
   if(_profilesHydrated&&!force&&_usersCache.length&&(now-_usersCacheTs)<LOCAL_PROFILE_CACHE_TTL) return _usersCache;
   __loadLocalProfiles().forEach(p=>__mergeProfile(p,{persist:false}));
+  await __loadProfilesFromSnapshot();
   if(!_ablyReady) return _usersCache;
   try{
     let page=await _ablyChannel(ONLINE_PROFILES_CHANNEL).history({limit:1000,direction:'backwards'});
@@ -4419,7 +4459,13 @@ function _setupAbly(resolve){
           _kv[key]=value;
           if(key==='players:index'||key.startsWith('players:')){
             try{ localStorage.setItem('_esh_kv_'+key,value); }catch(e){}
-            if(key.startsWith('players:')&&key!=='players:index'){
+            if(key===PLAYERS_SNAPSHOT_KEY){
+              try{
+                const snap=JSON.parse(value);
+                const players=Array.isArray(snap)?snap:(Array.isArray(snap?.players)?snap.players:[]);
+                players.forEach(u=>{ if(u?.name) __mergeProfile(u,{persist:true}); });
+              }catch(e){}
+            }else if(key.startsWith('players:')&&key!=='players:index'){
               try{ const u=JSON.parse(value); if(u?.name) __mergeProfile(u,{persist:true}); }catch(e){}
             }
           }
@@ -4673,14 +4719,13 @@ async function sbLogout(){
   if(prevUser){
     await _presenceLeave();
     const existing=_usersCache.find(u=>u&&u.name===prevUser.name)||{};
-    const hidden=Object.assign({},existing,{
+    const offlineProfile=Object.assign({},existing,{
       name:prevUser.name,color:prevUser.color,key:prevUser.key,
       pwHash:existing.pwHash||prevUser.pwHash||'',
-      scoreboardActive:false,online:false,lastSeen:Date.now(),updatedAt:Date.now()
+      scoreboardActive:true,online:false,lastSeen:Date.now(),updatedAt:Date.now()
     });
-    try{ await __publishProfile(hidden); }catch(e){}
-    __saveProfileLocal(hidden);
-    _usersCache=_usersCache.filter(u=>u&&u.name!==prevUser.name);
+    try{ await __publishProfile(offlineProfile); }catch(e){}
+    __mergeProfile(offlineProfile,{persist:true});
     _usersCacheTs=Date.now();
   }
   sbStopHeartbeat();
@@ -4740,9 +4785,12 @@ async function sbRequestDuel(targetName){
   if(_duelState){ _showToast('Un duel est déjà en cours.','var(--red)'); return; }
   if(!isUserOnline(targetName)){ _showToast(targetName+" n'est pas en ligne.",'var(--red)'); return; }
   const key=duelKey(_currentUser.name,targetName);
+  const questions=_buildDuelQuestionPack(DUEL_QUESTION_COUNT);
+  if(!questions.length){ _showToast('Impossible de préparer le duel.','var(--red)'); return; }
   sbShowDuelWaiting(targetName,key);
   _duelState={role:'challenger',key,opponent:targetName};
-  await storageSet(key,JSON.stringify({from:_currentUser.name,to:targetName,status:'pending',ts:Date.now()}),true);
+  await storageSet('esh_duel_result:'+key,JSON.stringify({}),true);
+  await storageSet(key,JSON.stringify({from:_currentUser.name,to:targetName,status:'pending',ts:Date.now(),questions,questionCount:questions.length}),true);
   try{ await _ablyChannel(ONLINE_DUELS_CHANNEL).publish('invite',{from:_currentUser.name,to:targetName,key}); }catch(e){}
   _duelState._timeout=setTimeout(()=>{
     if(_duelState?.role==='challenger'&&_duelState?.opponent===targetName){
@@ -4774,7 +4822,17 @@ async function sbAcceptDuel(from,key){
   document.getElementById('duel-modal')?.remove();
   document.getElementById('duel-notif-banner')?.remove();
   _duelState={role:'defender',key,opponent:from};
-  try{ await storageSet(key,JSON.stringify({from,to:_currentUser.name,status:'accepted',ts:Date.now()}),true); }catch(e){}
+  try{
+    const raw=await storageGet(key,true).catch(()=>null);
+    const payload=raw?.value?JSON.parse(raw.value):{};
+    payload.from=payload.from||from;
+    payload.to=_currentUser.name;
+    payload.status='accepted';
+    payload.acceptedAt=Date.now();
+    if(!Array.isArray(payload.questions)||!payload.questions.length) payload.questions=_buildDuelQuestionPack(DUEL_QUESTION_COUNT);
+    payload.questionCount=payload.questions.length;
+    await storageSet(key,JSON.stringify(payload),true);
+  }catch(e){}
   try{ await _ablyChannel(ONLINE_DUELS_CHANNEL).publish('accept',{from:_currentUser.name,to:from,key}); }catch(e){}
   await startDuelGame(from);
 }
@@ -4876,7 +4934,7 @@ function showLoginModal(){
         <button onclick="const i=document.getElementById('sb-pw-input');i.type=i.type==='password'?'text':'password'" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--t4);cursor:pointer;font-size:13px">👁</button>
       </div>
       <div id="sb-login-error" style="display:none;font-family:'DM Mono',monospace;font-size:10px;color:var(--red);padding:6px 10px;background:rgba(209,82,72,.08);border-radius:5px;border:1px solid rgba(209,82,72,.2)"></div>
-      <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--t4)">Le pseudo est public · Le profil reste visible dans le scoreboard jusqu'à la déconnexion.</div>
+      <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--t4)">Le pseudo est public · Le scoreboard recharge aussi les profils déjà publiés, même si le joueur n'est plus en ligne.</div>
       <div style="font-family:'DM Mono',monospace;font-size:9px;color:#d08040;padding:6px 10px;background:rgba(208,128,64,.08);border-radius:5px;border:1px solid rgba(208,128,64,.2)">⚠️ N'utilise pas un mot de passe personnel</div>
     </div>
     <div style="display:flex;gap:8px;margin-top:18px">
@@ -5127,13 +5185,12 @@ function buildWeightedQueue(refs,n){
   return q;
 }
 
-let _duelMistakes=0, _duelOpponentMistakes=0, _duelScore=0, _duelQIdx=0;
+const DUEL_MODES=['date_author','concept_author','title_author'];
+const DUEL_QUESTION_COUNT=10;
+let _duelScore=0, _duelOpponentScore=0, _duelQIdx=0, _duelOppAnswered=0;
 let _duelQueue=[], _duelResultKey=null;
 let _duelGamePollTimer=null, _duelFinished=false, _duelAnswered=false;
-let _duelOppAnswered=0;
-const DUEL_MODES=['date_author','concept_author','title_author'];
-
-function heartsHtml(n){ return '❤️'.repeat(Math.max(0,3-n))+'🖤'.repeat(Math.min(3,n)); }
+let _duelStartTs=0, _duelElapsedMs=0, _duelFinalized=false;
 
 function _duelFlash(side, color){
   const id=side==='me'?'duel-my-panel':'duel-opp-panel';
@@ -5145,32 +5202,131 @@ function _duelFlash(side, color){
   clearTimeout(el._flashTimer);
   el._flashTimer=setTimeout(()=>{ el.style.borderColor=''; el.style.background=''; },650);
 }
+function _duelFormatMs(ms){
+  const safe=Math.max(0,Math.round(Number(ms)||0));
+  const totalSec=Math.floor(safe/1000), min=Math.floor(totalSec/60), sec=String(totalSec%60).padStart(2,'0');
+  const cs=String(Math.floor((safe%1000)/10)).padStart(2,'0');
+  return `${min}:${sec}.${cs}`;
+}
+function _duelStatus(text,color){
+  const el=document.getElementById('duel-status-line');
+  if(!el) return;
+  el.textContent=text||'';
+  el.style.color=color||'var(--t4)';
+}
+function _duelProgressText(answered, score){
+  return `Score ${score}/${DUEL_QUESTION_COUNT} · ${answered}/${DUEL_QUESTION_COUNT} répondues`;
+}
+function _duelUpdatePanels(){
+  const my=document.getElementById('duel-my-score');
+  const opp=document.getElementById('duel-opp-score');
+  if(my) my.textContent=_duelProgressText(_duelQIdx,_duelScore);
+  if(opp) opp.textContent=_duelProgressText(_duelOppAnswered,_duelOpponentScore);
+}
+function _buildDuelQuestionPack(count){
+  const refs=buildWeightedQueue(ALL_REFS,Math.max(300,count*30));
+  const pack=[];
+  const seen=new Set();
+  let attempts=0;
+  while(pack.length<count && attempts<5000){
+    attempts++;
+    const ref=refs[Math.floor(Math.random()*refs.length)] || ALL_REFS[Math.floor(Math.random()*ALL_REFS.length)];
+    if(!ref) continue;
+    const mode=DUEL_MODES[Math.floor(Math.random()*DUEL_MODES.length)];
+    const dir=Math.random()<.5?'forward':'reverse';
+    const q=buildQuizQuestion(ref,mode,dir,ALL_REFS);
+    if(!q||!Array.isArray(q.choices)||q.choices.length!==4||q.correctIdx<0) continue;
+    const sig=[q.label,q.q,q.correct].join('|');
+    if(seen.has(sig)) continue;
+    seen.add(sig);
+    pack.push({label:q.label,q:q.q,hint:q.hint||'',choices:q.choices.slice(0,4),correct:q.correct,correctIdx:q.correctIdx});
+  }
+  return pack;
+}
+async function _duelReadResults(){
+  if(!_duelResultKey) return {};
+  try{
+    const raw=await storageGet(_duelResultKey,true);
+    return raw?.value?JSON.parse(raw.value):{};
+  }catch(e){ return {}; }
+}
+async function _duelPublishProgress(lastOk, finished, forfeit){
+  if(!_currentUser||!_duelResultKey) return {};
+  const res=await _duelReadResults();
+  const payload=Object.assign({}, res[_currentUser.name]||{}, {
+    score:_duelScore,
+    answered:_duelQIdx,
+    finished:!!finished,
+    forfeit:!!forfeit,
+    elapsedMs:(finished||forfeit)?(Date.now()-_duelStartTs):null,
+    lastOk:!!lastOk,
+    ts:Date.now()
+  });
+  res[_currentUser.name]=payload;
+  await storageSet(_duelResultKey,JSON.stringify(res),true);
+  return res;
+}
+function _duelComputeOutcome(my, opp){
+  const myScore=Number(my?.score||0), oppScore=Number(opp?.score||0);
+  const myTime=Number.isFinite(Number(my?.elapsedMs))?Number(my.elapsedMs):Number.MAX_SAFE_INTEGER;
+  const oppTime=Number.isFinite(Number(opp?.elapsedMs))?Number(opp.elapsedMs):Number.MAX_SAFE_INTEGER;
+  if(my?.forfeit&&!opp?.forfeit) return {won:false, reason:'abandon', myScore, oppScore, myTime, oppTime};
+  if(opp?.forfeit&&!my?.forfeit) return {won:true, reason:'abandon_adverse', myScore, oppScore, myTime, oppTime};
+  if(myScore!==oppScore) return {won:myScore>oppScore, reason:'score', myScore, oppScore, myTime, oppTime};
+  if(myTime!==oppTime) return {won:myTime<oppTime, reason:'temps', myScore, oppScore, myTime, oppTime};
+  return {won:(Number(my?.ts||0)<=Number(opp?.ts||0)), reason:'photo_finish', myScore, oppScore, myTime, oppTime};
+}
+async function _duelTryFinalize(opponentName, forcedOutcome){
+  if(_duelFinalized||!_currentUser) return false;
+  let outcome=forcedOutcome||null;
+  let res=await _duelReadResults();
+  const my=res[_currentUser.name]||null;
+  const opp=res[opponentName]||null;
+  if(!outcome){
+    if(my?.forfeit) outcome=_duelComputeOutcome(my,opp||{});
+    else if(opp?.forfeit) outcome=_duelComputeOutcome(my||{},opp);
+    else if(my?.finished&&opp?.finished) outcome=_duelComputeOutcome(my,opp);
+  }
+  if(!outcome) return false;
+  _duelFinalized=true;
+  _duelFinished=true;
+  _showDuelEnd(opponentName,outcome,my||{},opp||{});
+  return true;
+}
 
 async function startDuelGame(opponentName){
   try{
     if(!_currentUser) return;
-    // Fermer toute modale d'attente
     document.getElementById('duel-modal')?.remove();
     document.getElementById('duel-notif-banner')?.remove();
-    // Réinitialiser l'état du jeu
-    _duelMistakes=0; _duelOpponentMistakes=0; _duelScore=0; _duelQIdx=0;
-    _duelFinished=false; _duelAnswered=false; _duelOppAnswered=0;
-    // Conserver le role existant ou mettre challenger par défaut
+    _duelScore=0; _duelOpponentScore=0; _duelQIdx=0; _duelOppAnswered=0;
+    _duelFinished=false; _duelAnswered=false; _duelFinalized=false;
+    _duelElapsedMs=0; _duelStartTs=Date.now();
     const role = _duelState?.role || 'challenger';
     const key  = _duelState?.key  || duelKey(_currentUser.name, opponentName);
     _duelState = { role, key, opponent: opponentName };
-    _duelResultKey='esh_duel_result:'+[_currentUser.name,opponentName].sort().join(':');
-    if(_ablyReady) try{ await storageSet(_duelResultKey,JSON.stringify({}),true); }catch(e){}
-    const refs=buildWeightedQueue(ALL_REFS,300);
-    _duelQueue=refs.map(ref=>buildQuizQuestion(ref,DUEL_MODES[Math.floor(Math.random()*DUEL_MODES.length)],Math.random()<.5?'forward':'reverse',ALL_REFS)).filter(q=>q&&Array.isArray(q.choices)&&q.choices.length===4&&q.correctIdx>=0);
+    _duelResultKey='esh_duel_result:'+key;
+    const raw=await storageGet(key,true).catch(()=>null);
+    let duelData=raw?.value?JSON.parse(raw.value):{};
+    if(!Array.isArray(duelData.questions)||!duelData.questions.length){
+      duelData.questions=_buildDuelQuestionPack(DUEL_QUESTION_COUNT);
+      duelData.questionCount=duelData.questions.length;
+      duelData.from=duelData.from||_currentUser.name;
+      duelData.to=duelData.to||opponentName;
+      duelData.status=duelData.status||'accepted';
+      duelData.ts=duelData.ts||Date.now();
+      await storageSet(key,JSON.stringify(duelData),true);
+    }
+    _duelQueue=duelData.questions.slice(0,DUEL_QUESTION_COUNT);
     if(!_duelQueue.length) throw new Error('DUEL_QUEUE_EMPTY');
-    // Écouter les updates adversaire via Ably push (remplace le poll)
+    await _duelPublishProgress(false,false,false);
     _startDuelAblyPush(opponentName);
     _renderDuel(opponentName);
   }catch(e){
     console.warn('[Duel] start error:',e);
     _duelState=null;
     _duelFinished=false;
+    _duelFinalized=false;
     if(_duelGamePollTimer){clearInterval(_duelGamePollTimer);_duelGamePollTimer=null;}
     document.getElementById('duel-modal')?.remove();
     document.getElementById('duel-notif-banner')?.remove();
@@ -5178,86 +5334,69 @@ async function startDuelGame(opponentName){
   }
 }
 
+function _duelSyncOpponentFromResults(opponentName,res){
+  const opp=res?.[opponentName]||{};
+  const prevAnswered=_duelOppAnswered;
+  _duelOppAnswered=Number(opp.answered||0);
+  _duelOpponentScore=Number(opp.score||0);
+  if(_duelOppAnswered>prevAnswered) _duelFlash('opp',opp.lastOk?'green':'red');
+  _duelUpdatePanels();
+  if(opp.forfeit) _duelStatus(`${opponentName} a abandonné.`, 'var(--green)');
+  else if(opp.finished) _duelStatus(`${opponentName} a terminé en ${_duelFormatMs(opp.elapsedMs)}.`, 'var(--t3)');
+  return opp;
+}
 function _startDuelAblyPush(opponentName){
   if(_duelGamePollTimer){ clearInterval(_duelGamePollTimer); _duelGamePollTimer=null; }
-  // Écouter les updates adversaire via le canal KV Ably
   const kvCh=_ablyChannel(ONLINE_KV_CHANNEL);
   if(kvCh){
     kvCh.subscribe('set', async (msg)=>{
       if(!msg.data || msg.data.key !== _duelResultKey) return;
-      if(_duelFinished) return;
+      if(_duelFinalized) return;
       try{
         const res=JSON.parse(msg.data.value);
-        const opp=res[opponentName]||{};
-        const oppAns=opp.answered||0;
-        if(oppAns>_duelOppAnswered){
-          _duelOppAnswered=oppAns;
-          _duelFlash('opp',opp.lastOk?'green':'red');
-        }
-        const newOppMistakes=opp.mistakes||0;
-        if(newOppMistakes!==_duelOpponentMistakes){
-          _duelOpponentMistakes=newOppMistakes;
-          const el=document.getElementById('duel-opp-hearts');
-          if(el) el.innerHTML=heartsHtml(_duelOpponentMistakes);
-        }
-        const oppLost=newOppMistakes>=3||opp.forfeit||opp.lost;
-        if(oppLost&&!_duelFinished&&_duelMistakes<3){
-          _duelFinished=true;
-          _showDuelEnd(opponentName,true);
-        }
+        _duelSyncOpponentFromResults(opponentName,res);
+        await _duelTryFinalize(opponentName);
       }catch(e){}
     });
   }
-  // Fallback poll toutes les 2s
   _duelGamePollTimer=setInterval(async()=>{
-    if(_duelFinished){ clearInterval(_duelGamePollTimer); return; }
-    if(!_ablyReady) return;
+    if(_duelFinalized){ clearInterval(_duelGamePollTimer); return; }
     try{
-      const raw=await storageGet(_duelResultKey,true);
-      if(!raw) return;
-      const res=JSON.parse(raw.value);
-      const opp=res[opponentName]||{};
-      const newOppMistakes=opp.mistakes||0;
-      if(newOppMistakes!==_duelOpponentMistakes){
-        _duelOpponentMistakes=newOppMistakes;
-        const el=document.getElementById('duel-opp-hearts');
-        if(el) el.innerHTML=heartsHtml(_duelOpponentMistakes);
-      }
-      const oppLost=newOppMistakes>=3||opp.forfeit||opp.lost;
-      if(oppLost&&!_duelFinished&&_duelMistakes<3){
-        _duelFinished=true;
-        clearInterval(_duelGamePollTimer);
-        _showDuelEnd(opponentName,true);
-      }
+      const res=await _duelReadResults();
+      _duelSyncOpponentFromResults(opponentName,res);
+      await _duelTryFinalize(opponentName);
     }catch(e){}
   },2000);
 }
 
 function _renderDuel(opponentName){
   _duelAnswered=false;
-  const q=_duelQueue[_duelQIdx%_duelQueue.length];
-  // Supprimer toute modale d'attente existante et créer l'overlay duel en plein écran
+  const q=_duelQueue[_duelQIdx];
+  if(!q){
+    _renderDuelWaiting(opponentName);
+    return;
+  }
   let overlay=document.getElementById('duel-modal');
   if(overlay) overlay.remove();
   overlay=document.createElement('div');
   overlay.id='duel-modal';
   document.body.appendChild(overlay);
   overlay.style.cssText='position:fixed;inset:0;background:var(--bg);z-index:2000;overflow-y:auto;display:block';
-  overlay.innerHTML=`<div style="max-width:540px;margin:0 auto;padding:16px;width:100%;box-sizing:border-box">
+  overlay.innerHTML=`<div style="max-width:560px;margin:0 auto;padding:16px;width:100%;box-sizing:border-box">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
       <button onclick="sbForfeitDuel('${opponentName}')" style="background:none;border:none;color:var(--t4);cursor:pointer;font-size:11px;padding:4px">✕ Abandon</button>
-      <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--t4)">⚔️ DUEL · Q.${_duelScore+1}</div>
-      <div></div>
+      <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--t4)">⚔️ DUEL · Question ${_duelQIdx+1}/${DUEL_QUESTION_COUNT}</div>
+      <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--t4)">${_duelFormatMs(Date.now()-_duelStartTs)}</div>
     </div>
     <div style="display:flex;gap:8px;margin-bottom:14px">
       <div id="duel-my-panel" style="flex:1;background:var(--s2);border:2px solid ${_currentUser.color};border-radius:8px;padding:9px;text-align:center;transition:border-color .1s,background .1s">
         <div style="font-weight:600;font-size:11px;color:var(--fg);margin-bottom:4px">${_currentUser.name}</div>
-        <div id="duel-my-hearts" style="font-size:15px">${heartsHtml(_duelMistakes)}</div>
+        <div id="duel-my-score" style="font-family:'DM Mono',monospace;font-size:10px;color:var(--t3)">${_duelProgressText(_duelQIdx,_duelScore)}</div>
       </div>
       <div style="display:flex;align-items:center;font-family:'Cormorant Garamond',serif;font-size:15px;color:var(--t4);font-weight:600;flex-shrink:0">VS</div>
       <div id="duel-opp-panel" style="flex:1;background:var(--s2);border:2px solid var(--bd);border-radius:8px;padding:9px;text-align:center;transition:border-color .1s,background .1s">
         <div style="font-weight:600;font-size:11px;color:var(--fg);margin-bottom:4px">${opponentName}</div>
-        <div id="duel-opp-hearts" style="font-size:15px">${heartsHtml(_duelOpponentMistakes)}</div>
+        <div id="duel-opp-score" style="font-family:'DM Mono',monospace;font-size:10px;color:var(--t3)">${_duelProgressText(_duelOppAnswered,_duelOpponentScore)}</div>
       </div>
     </div>
     <div style="background:var(--s2);border:1px solid var(--bd);border-radius:9px;padding:15px;margin-bottom:11px">
@@ -5265,96 +5404,119 @@ function _renderDuel(opponentName){
       <div style="font-size:15px;font-weight:500;color:var(--fg);line-height:1.5">${q.q}</div>
       ${q.hint?`<div style="font-family:'DM Mono',monospace;font-size:10px;color:var(--t4);margin-top:5px">${q.hint}</div>`:''}
     </div>
-    <div style="display:flex;flex-direction:column;gap:6px">
+    <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px">
       ${q.choices.map((ch,ci)=>`<button id="dopt${ci}" onclick="duelAnswer(${ci},'${opponentName}')"
         style="text-align:left;padding:11px 14px;background:var(--s1);border:1px solid var(--bd);border-radius:8px;color:var(--fg);cursor:pointer;font-size:13px;font-family:'DM Sans',sans-serif;transition:background .07s,border-color .07s"
         onmouseover="if(!this.dataset.done)this.style.background='var(--s2)'"
         onmouseout="if(!this.dataset.done)this.style.background='var(--s1)'"
       >${ch}</button>`).join('')}
     </div>
+    <div id="duel-status-line" style="font-family:'DM Mono',monospace;font-size:10px;color:var(--t4);text-align:center;min-height:16px">Réponds aux 10 questions. En cas d'égalité, le temps total départage.</div>
   </div>`;
 }
+function _renderDuelWaiting(opponentName){
+  let overlay=document.getElementById('duel-modal');
+  if(!overlay){
+    overlay=document.createElement('div');
+    overlay.id='duel-modal';
+    document.body.appendChild(overlay);
+    overlay.style.cssText='position:fixed;inset:0;background:var(--bg);z-index:2000;overflow-y:auto;display:block';
+  }
+  overlay.innerHTML=`<div style="max-width:520px;margin:0 auto;padding:40px 16px;text-align:center">
+    <div style="font-size:44px;margin-bottom:12px">⏳</div>
+    <div style="font-family:'Cormorant Garamond',serif;font-size:30px;font-weight:600;color:var(--fg);margin-bottom:10px">Terminé</div>
+    <div style="font-family:'DM Mono',monospace;font-size:11px;color:var(--t4);line-height:1.9;margin-bottom:20px">
+      Score final provisoire : <strong style="color:var(--fg)">${_duelScore}/${DUEL_QUESTION_COUNT}</strong><br>
+      Ton temps : <strong style="color:var(--fg)">${_duelFormatMs(_duelElapsedMs||Date.now()-_duelStartTs)}</strong><br>
+      En attente de <strong style="color:var(--fg)">${opponentName}</strong>…
+    </div>
+    <div id="duel-my-panel" style="background:var(--s2);border:1px solid var(--bd);border-radius:8px;padding:12px;margin-bottom:10px">
+      <div style="font-weight:600;font-size:12px;color:var(--fg);margin-bottom:4px">${_currentUser.name}</div>
+      <div id="duel-my-score" style="font-family:'DM Mono',monospace;font-size:10px;color:var(--t3)">${_duelProgressText(_duelQIdx,_duelScore)}</div>
+    </div>
+    <div id="duel-opp-panel" style="background:var(--s2);border:1px solid var(--bd);border-radius:8px;padding:12px;margin-bottom:14px">
+      <div style="font-weight:600;font-size:12px;color:var(--fg);margin-bottom:4px">${opponentName}</div>
+      <div id="duel-opp-score" style="font-family:'DM Mono',monospace;font-size:10px;color:var(--t3)">${_duelProgressText(_duelOppAnswered,_duelOpponentScore)}</div>
+    </div>
+    <div id="duel-status-line" style="font-family:'DM Mono',monospace;font-size:10px;color:var(--t4)">Le duel se termine dès que les deux joueurs ont répondu à leurs 10 questions.</div>
+  </div>`;
+  _duelUpdatePanels();
+}
 
-function duelAnswer(choiceIdx, opponentName){
+async function duelAnswer(choiceIdx, opponentName){
   if(_duelAnswered||_duelFinished) return;
   _duelAnswered=true;
   for(let i=0;i<4;i++){ const b=document.getElementById('dopt'+i); if(b){b.disabled=true;b.dataset.done='1';} }
-  const q=_duelQueue[_duelQIdx%_duelQueue.length];
+  const q=_duelQueue[_duelQIdx];
+  if(!q) return;
   const correct=(choiceIdx===q.correctIdx);
   const cb=document.getElementById('dopt'+choiceIdx);
   const gb=document.getElementById('dopt'+q.correctIdx);
   if(correct){
+    _duelScore++;
     if(cb){cb.style.background='rgba(46,204,113,.25)';cb.style.borderColor='#2ecc71';}
     _duelFlash('me','green');
   } else {
     if(cb){cb.style.background='rgba(231,76,60,.2)';cb.style.borderColor='#e74c3c';}
     if(gb){gb.style.background='rgba(46,204,113,.15)';gb.style.borderColor='#2ecc71';}
-    _duelMistakes++; _duelFlash('me','red');
-    const mh=document.getElementById('duel-my-hearts');
-    if(mh) mh.innerHTML=heartsHtml(_duelMistakes);
+    _duelFlash('me','red');
   }
-  _duelScore++; _duelQIdx++;
-  if(_duelMistakes>=3){
+  _duelQIdx++;
+  _duelUpdatePanels();
+  const finishedNow=_duelQIdx>=DUEL_QUESTION_COUNT;
+  if(finishedNow){
     _duelFinished=true;
-    if(_duelGamePollTimer){clearInterval(_duelGamePollTimer);_duelGamePollTimer=null;}
-    (async()=>{
-      if(_ablyReady&&_currentUser) try{
-        const raw=await storageGet(_duelResultKey,true);
-        const res=raw?JSON.parse(raw.value):{};
-        const prev=res[_currentUser.name]||{};
-        res[_currentUser.name]={mistakes:3,lost:true,answered:(prev.answered||0)+1,lastOk:false,ts:Date.now()};
-        await storageSet(_duelResultKey,JSON.stringify(res),true);
-      }catch(e){}
-      setTimeout(async()=>{
-        try{
-          const raw=await storageGet(_duelResultKey,true);
-          const res=raw?JSON.parse(raw.value):{};
-          const opp=res[opponentName]||{};
-          if(opp.lost||opp.forfeit||(opp.mistakes||0)>=3){
-            const myTs=res[_currentUser.name]?.ts||0, oppTs=opp.ts||0;
-            _showDuelEnd(opponentName,oppTs<myTs);
-          } else { _showDuelEnd(opponentName,false); }
-        }catch(e){ _showDuelEnd(opponentName,false); }
-      },600);
-    })();
+    _duelElapsedMs=Date.now()-_duelStartTs;
+  }
+  const res=await _duelPublishProgress(correct, finishedNow, false).catch(()=>({}));
+  if(finishedNow){
+    _renderDuelWaiting(opponentName);
+    _duelStatus(`Terminé en ${_duelFormatMs(_duelElapsedMs)}.`, 'var(--t3)');
+    if(!(await _duelTryFinalize(opponentName))) {
+      const opp=res?.[opponentName]||{};
+      if(opp.finished) await _duelTryFinalize(opponentName);
+    }
     return;
   }
-  if(_ablyReady&&_currentUser) storageGet(_duelResultKey,true).then(raw=>{
-    const res=raw?JSON.parse(raw.value):{};
-    const prev=res[_currentUser.name]||{};
-    res[_currentUser.name]={mistakes:_duelMistakes,answered:(prev.answered||0)+1,lastOk:correct,ts:Date.now()};
-    return storageSet(_duelResultKey,JSON.stringify(res),true);
-  }).catch(()=>{});
-  setTimeout(()=>{ if(!_duelFinished) _renderDuel(opponentName); },correct?260:720);
+  setTimeout(()=>{ if(!_duelFinalized) _renderDuel(opponentName); },correct?260:720);
 }
 
 async function sbForfeitDuel(opponentName){
   if(!confirm('Abandonner le duel ?')) return;
   _duelFinished=true;
+  _duelElapsedMs=Date.now()-_duelStartTs;
   if(_duelGamePollTimer){clearInterval(_duelGamePollTimer);_duelGamePollTimer=null;}
-  if(_ablyReady&&_currentUser) try{
-    const raw=await storageGet(_duelResultKey,true);
-    const res=raw?JSON.parse(raw.value):{};
-    res[_currentUser.name]={mistakes:3,forfeit:true,ts:Date.now()};
-    await storageSet(_duelResultKey,JSON.stringify(res),true);
-  }catch(e){}
-  _showDuelEnd(opponentName,false);
+  await _duelPublishProgress(false,true,true).catch(()=>({}));
+  await _duelTryFinalize(opponentName,{won:false,reason:'abandon',myScore:_duelScore,oppScore:_duelOpponentScore,myTime:_duelElapsedMs,oppTime:null});
 }
 
-function _showDuelEnd(opponentName,won){
+function _showDuelEnd(opponentName,outcome,my,opp){
   if(_duelGamePollTimer){clearInterval(_duelGamePollTimer);_duelGamePollTimer=null;}
   _duelFinished=true;
   _duelState=null;
+  const won=!!outcome?.won;
   if(_currentUser&&_ablyReady) getDuelStats().then(({duelsPlayed,duelsWon})=>{
     sbPushMyStats({duelsPlayed:duelsPlayed+1,duelsWon:duelsWon+(won?1:0)});
   }).catch(()=>{});
   const overlay=document.getElementById('duel-modal'); if(!overlay) return;
-  overlay.innerHTML=`<div style="max-width:400px;margin:auto;padding:60px 20px;text-align:center">
+  const myScore=Number(outcome?.myScore ?? my?.score ?? _duelScore ?? 0);
+  const oppScore=Number(outcome?.oppScore ?? opp?.score ?? _duelOpponentScore ?? 0);
+  const myTime=Number.isFinite(Number(outcome?.myTime))?Number(outcome.myTime):(Number.isFinite(Number(my?.elapsedMs))?Number(my.elapsedMs):_duelElapsedMs);
+  const oppTime=Number.isFinite(Number(outcome?.oppTime))?Number(outcome.oppTime):(Number.isFinite(Number(opp?.elapsedMs))?Number(opp.elapsedMs):null);
+  const reason=outcome?.reason||'score';
+  let sub='';
+  if(reason==='score') sub=`${myScore}-${oppScore} au score sur ${DUEL_QUESTION_COUNT} questions.`;
+  else if(reason==='temps') sub=`Égalité ${myScore}-${oppScore}, départage au temps.`;
+  else if(reason==='photo_finish') sub=`Égalité parfaite ${myScore}-${oppScore}, victoire au finish.`;
+  else if(reason==='abandon') sub=`Tu as abandonné le duel.`;
+  else if(reason==='abandon_adverse') sub=`${opponentName} a abandonné le duel.`;
+  overlay.innerHTML=`<div style="max-width:420px;margin:auto;padding:60px 20px;text-align:center">
     <div style="font-size:56px;margin-bottom:14px">${won?'🏆':'💀'}</div>
     <div style="font-family:'Cormorant Garamond',serif;font-size:30px;font-weight:600;color:var(--fg);margin-bottom:8px">${won?'Victoire !':'Défaite'}</div>
-    <div style="font-family:'DM Mono',monospace;font-size:11px;color:var(--t4);line-height:2;margin-bottom:24px">
-      ${won?`Tu as éliminé <strong style="color:var(--fg)">${opponentName}</strong> !`:`<strong style="color:var(--fg)">${opponentName}</strong> t'a eu.`}<br>
-      ${_duelScore} question${_duelScore>1?'s':''} · ${_duelMistakes} faute${_duelMistakes>1?'s':''}
+    <div style="font-family:'DM Mono',monospace;font-size:11px;color:var(--t4);line-height:2;margin-bottom:16px">
+      ${sub}<br>
+      Ton score : <strong style="color:var(--fg)">${myScore}/${DUEL_QUESTION_COUNT}</strong>${Number.isFinite(myTime)?` · ${_duelFormatMs(myTime)}`:''}<br>
+      ${opponentName} : <strong style="color:var(--fg)">${oppScore}/${DUEL_QUESTION_COUNT}</strong>${Number.isFinite(oppTime)?` · ${_duelFormatMs(oppTime)}`:''}
     </div>
     <button class="qnbtn qng" onclick="document.getElementById('duel-modal').remove();_duelState=null;go('scoreboard')" style="font-size:12px;padding:10px 24px">Retour au classement</button>
   </div>`;
@@ -6651,6 +6813,8 @@ function chatHandleInput(el){
   if(!el) return;
   el.style.height='auto';
   el.style.height=Math.min(el.scrollHeight,80)+'px';
+  _chatPmActiveIdx = 0;
+  _chatPmLastToken = '';
   chatRenderFooter();
 }
 function chatInputKeydown(event){
@@ -6795,11 +6959,15 @@ function chatRenderMessages(){
 function chatRenderFooter(){
   const footer = document.getElementById('chat-footer');
   if(!footer) return;
+  const prevInput = document.getElementById('chat-input');
+  const currentValue = prevInput?.value || '';
+  const hadFocus = document.activeElement===prevInput;
+  const selStart = hadFocus ? prevInput.selectionStart : null;
+  const selEnd = hadFocus ? prevInput.selectionEnd : null;
   if(!_currentUser){
     footer.innerHTML = `<div class="chat-login-hint">Connecte-toi au scoreboard<br>pour participer au chat.</div>`;
     return;
   }
-  const currentValue = document.getElementById('chat-input')?.value || '';
   const parsed = _chatParseCommand(currentValue);
   const matches = parsed.isPm && parsed.selectingRecipient ? _chatPmMatches(parsed.targetToken) : [];
   footer.innerHTML = `
@@ -6816,6 +6984,10 @@ function chatRenderFooter(){
     input.value = currentValue;
     input.style.height='auto';
     input.style.height=Math.min(input.scrollHeight,80)+'px';
+    if(hadFocus){
+      input.focus();
+      try{ input.setSelectionRange(selStart ?? currentValue.length, selEnd ?? currentValue.length); }catch(e){}
+    }
   }
 }
 
